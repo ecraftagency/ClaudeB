@@ -833,9 +833,17 @@ model = "gemini-3-flash-preview"
         from pg_diagnose.config import Config
         config = Config.load(args.config)
         config.override_from_args(args)
+
+        # Show where config was loaded from
+        if config._config_file:
+            if args.config:
+                print(f"Config: {config._config_file}")
+            else:
+                print(f"Config: {config._config_file} (auto-detected)")
     except ImportError:
         # Fallback to args-only mode
         config = None
+        print("Config: (no config file, using CLI args)")
     except FileNotFoundError as e:
         print(f"Error: {e}")
         sys.exit(1)
@@ -843,7 +851,8 @@ model = "gemini-3-flash-preview"
     # Handle --show-config
     if args.show_config:
         if config:
-            print(config.summary())
+            # Config path already printed above, show rest of summary
+            print(config.summary(include_config_path=False))
         else:
             print("No config loaded (using command-line args)")
         sys.exit(0)
@@ -902,9 +911,9 @@ model = "gemini-3-flash-preview"
         print("\nRun with --init-config to create a config file")
         sys.exit(1)
 
-    # Show config summary
+    # Show config summary (config path already printed above)
     if verbose and config:
-        print(config.summary())
+        print(config.summary(include_config_path=False))
         print()
 
     # Run test

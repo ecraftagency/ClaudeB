@@ -28,10 +28,14 @@ except ImportError:
         tomllib = None
 
 
+# Project root (where this file lives)
+PROJECT_ROOT = Path(__file__).parent.resolve()
+
 # Default config file locations (searched in order)
 CONFIG_SEARCH_PATHS = [
-    Path("config.toml"),
-    Path("pg_diagnose.toml"),
+    PROJECT_ROOT / "config.toml",              # Project root (primary)
+    PROJECT_ROOT / "pg_diagnose.toml",         # Alternative name
+    Path.cwd() / "config.toml",                # Current working directory
     Path.home() / ".pg_diagnose" / "config.toml",
     Path.home() / ".config" / "pg_diagnose" / "config.toml",
 ]
@@ -320,14 +324,15 @@ class Config:
 
         return errors
 
-    def summary(self) -> str:
+    def summary(self, include_config_path: bool = True) -> str:
         """Generate human-readable config summary."""
         lines = []
 
-        if self._config_file:
-            lines.append(f"Config: {self._config_file}")
-        else:
-            lines.append("Config: (defaults)")
+        if include_config_path:
+            if self._config_file:
+                lines.append(f"Config: {self._config_file}")
+            else:
+                lines.append("Config: (defaults)")
 
         lines.append(f"Database: {self.database.user}@{self.database.host}:{self.database.port}/{self.database.name}")
 
