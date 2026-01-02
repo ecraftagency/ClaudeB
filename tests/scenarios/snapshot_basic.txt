@@ -1,0 +1,41 @@
+# Basic Snapshot/Restore Test Scenario
+# Tests: automatic initial snapshot, restore to initial
+#
+# Expected flow:
+# 1. Start session with default strategy
+# 2. Run baseline benchmark
+# 3. Accept target
+# 4. Apply first tuning (auto-creates initial snapshot)
+# 5. Run benchmark
+# 6. List snapshots (should show 'initial')
+# 7. Dry-run restore (preview changes)
+# 8. Restore to initial state
+# 9. Exit
+
+# Start with default strategy
+/go
+
+# Run baseline benchmark
+/run
+
+# Accept suggested target
+/accept
+
+# Apply first tuning round
+# This should auto-create 'initial' snapshot
+/apply
+
+# Run benchmark to see improvement
+/run
+
+# Verify snapshot was created
+/snapshot list
+
+# Preview what restore would change
+/restore --dry-run
+
+# Actually restore to initial state
+/restore
+
+# Exit session
+/quit

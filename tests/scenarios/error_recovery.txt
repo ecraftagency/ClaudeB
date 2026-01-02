@@ -1,0 +1,37 @@
+# Error Recovery Test Scenario
+# Tests handling of 0 TPS benchmark result and recovery
+# Uses error_scenario which simulates 0 TPS on first round
+
+# Start with default strategy
+/go
+
+# Accept the benchmark configuration
+/run
+
+# Accept the suggested target
+/accept
+
+# Apply first round tuning (this will lead to 0 TPS)
+/apply
+
+# Run round 1 benchmark - will return 0 TPS
+/run
+
+# System should detect 0 TPS and offer recovery options
+# Skip this round and continue
+/skip
+
+# Apply recovery tuning
+/apply
+
+# Run round 2 benchmark
+/run
+
+# Continue with normal flow
+/apply
+
+# Run round 3 benchmark
+/run
+
+# Exit
+/quit

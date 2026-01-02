@@ -1,0 +1,24 @@
+# Pause and Resume Test Scenario
+# Tests the ability to pause a session and resume it later
+# This file is for the FIRST run (which gets paused)
+
+# Start with default strategy
+/go
+
+# Accept the benchmark configuration
+/run
+
+# Accept the suggested target
+/accept
+
+# Apply first round tuning
+/apply
+
+# Run round 1 benchmark
+/run
+
+# Now pause the session
+/pause
+
+# Exit (session should be saved)
+/quit

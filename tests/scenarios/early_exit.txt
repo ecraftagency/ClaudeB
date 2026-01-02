@@ -1,0 +1,23 @@
+# Early Exit Test Scenario
+# Tests clean exit at various stages
+
+# Start with default strategy
+/go
+
+# Skip the benchmark
+/skip
+
+# Go back to strategy selection
+/back
+
+# Choose different strategy (second option)
+2
+
+# Accept the benchmark
+/run
+
+# Set custom target
+/set 10000
+
+# Now exit early
+/quit

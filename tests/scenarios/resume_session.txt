@@ -1,0 +1,19 @@
+# Resume Session Test Scenario
+# Tests resuming a previously paused session
+# Must be run after pause_resume.txt with --resume flag
+
+# Continue with the tuning
+# Apply round 2 tuning
+/apply
+
+# Run round 2 benchmark
+/run
+
+# Apply round 3 tuning
+/apply
+
+# Run round 3 benchmark
+/run
+
+# Session should complete
+/quit

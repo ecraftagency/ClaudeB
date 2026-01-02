@@ -1,0 +1,35 @@
+# Custom DBA Input Test Scenario
+# Tests the /custom command for providing DBA guidance
+
+# Use custom strategy selection
+/custom
+Focus on WAL optimization for write-heavy workload
+
+# Accept the benchmark
+/run
+
+# Set custom target
+/set 12000
+
+# Apply first round with custom guidance
+/custom
+Be conservative with shared_buffers, max 8GB
+
+# Apply tuning
+/apply
+
+# Run benchmark
+/run
+
+# Provide feedback after benchmark
+/custom
+The checkpoint spikes are still too frequent, focus on checkpoint settings
+
+# Apply tuning
+/apply
+
+# Run benchmark
+/run
+
+# Exit
+/quit

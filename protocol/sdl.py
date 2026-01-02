@@ -1,0 +1,278 @@
+"""
+Strategy Definition Language (SDL) - Agent → Runner protocol.
+
+The SDL is the JSON-based protocol used by the Agent to program the Runner.
+It defines Workload, Telemetry, and Success Criteria.
+"""
+
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Optional, Any, Union
+from datetime import datetime
+import json
+
+
+@dataclass
+class SetupTeardown:
+    """Pre-flight or cleanup SQL configuration."""
+    sql: List[str]
+    timeout_ms: int = 30000
+
+
+@dataclass
+class BenchmarkConfig:
+    """Core benchmark configuration."""
+    tool: str = "pgbench"
+    script_type: str = "custom"  # custom, tpcb
+
+    # For custom scripts
+    sql_template: Optional[str] = None
+
+    # For tpcb
+    scale: Optional[int] = None
+
+    # Execution parameters
+    clients: Union[int, List[int]] = 10
+    threads: Optional[int] = None
+    duration_sec: int = 60
+    rate_limit: Optional[int] = None
+
+    # pgbench variables
+    variables: Dict[str, str] = field(default_factory=dict)
+
+    # Special flags
+    new_connection_per_tx: bool = False  # pgbench -C flag
+
+
+@dataclass
+class ExecutionPlan:
+    """Complete execution plan for a strategy."""
+    # Benchmark type and configuration
+    benchmark_type: str = "pgbench"  # pgbench, custom
+    custom_sql: Optional[str] = None  # For custom benchmarks
+
+    # Execution parameters
+    scale: int = 100
+    clients: int = 10
+    threads: Optional[int] = None
+    duration_seconds: int = 60
+    warmup_seconds: int = 5
+    rate_limit: Optional[int] = None
+
+    # Setup/Teardown
+    setup: Optional[SetupTeardown] = None
+    benchmark: Optional[BenchmarkConfig] = None
+    teardown: Optional[SetupTeardown] = None
+
+
+@dataclass
+class TelemetryRequirement:
+    """Specifies what telemetry the AI needs to evaluate results."""
+    source: str  # pg_stat_database, pg_stat_activity, system_cpu, etc.
+    metric_keys: List[str]
+    sampling_interval_ms: int = 1000
+
+
+@dataclass
+class SuccessCriteria:
+    """How the AI judges success/failure."""
+    # Primary targets
+    target_tps: Optional[float] = None
+    max_latency_p99_ms: Optional[float] = None
+    min_cache_hit_ratio: Optional[float] = None
+    vs_baseline: Optional[str] = None  # e.g., "improve_10_pct"
+
+    # Alternative (generic) fields
+    primary_kpi: str = "tps"  # tps, latency_avg_ms, etc.
+    direction: str = "higher_is_better"  # higher_is_better, lower_is_better
+    target_value: Optional[float] = None
+
+    # Additional constraints
+    latency_p99_max_ms: Optional[float] = None
+    deadlock_count_max: Optional[int] = None
+    error_rate_max_pct: Optional[float] = None
+    cpu_usage_max_pct: Optional[float] = None
+
+
+@dataclass
+class StrategyMetadata:
+    """Metadata for debugging and audit."""
+    generated_at: str = ""
+    model_id: str = ""
+    reasoning_tokens: Optional[int] = None
+
+    def __post_init__(self):
+        if not self.generated_at:
+            self.generated_at = datetime.utcnow().isoformat() + "Z"
+
+
+@dataclass
+class TuningChunk:
+    """A single tuning change to apply."""
+    id: str
+    category: str  # memory, wal, checkpoint, connection, query, os
+    name: str
+    description: str = ""
+    apply_commands: List[str] = field(default_factory=list)
+    rollback_commands: List[str] = field(default_factory=list)
+    requires_restart: bool = False
+    verification_command: Optional[str] = None
+    verification_expected: Optional[str] = None
+    priority: str = "MEDIUM"  # HIGH, MEDIUM, LOW
+
+
+@dataclass
+class OsTuning:
+    """OS-level tuning (sysctl, etc.)."""
+    id: str
+    name: str
+    description: str = ""
+    apply_command: str = ""
+    rollback_command: str = ""
+    persistent_file: Optional[str] = None
+    persistent_line: Optional[str] = None
+
+
+@dataclass
+class Round1Config:
+    """Round 1 configuration tuning response from AI."""
+    protocol_version: str = "v2"
+    response_type: str = "round1_config"
+    rationale: str = ""
+    tuning_chunks: List[TuningChunk] = field(default_factory=list)
+    os_tuning: List[OsTuning] = field(default_factory=list)
+    restart_required: bool = False
+    restart_reason: str = ""
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Round1Config":
+        """Create from dictionary (parsed from AI response)."""
+        if "tuning_chunks" in data:
+            data["tuning_chunks"] = [
+                TuningChunk(**chunk) if isinstance(chunk, dict) else chunk
+                for chunk in data["tuning_chunks"]
+            ]
+        if "os_tuning" in data:
+            data["os_tuning"] = [
+                OsTuning(**ot) if isinstance(ot, dict) else ot
+                for ot in data["os_tuning"]
+            ]
+        # Filter to valid fields only
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered)
+
+
+@dataclass
+class StrategyDefinition:
+    """
+    The Strategy Definition Language (SDL) payload.
+
+    Generated by AI Agent, executed by Runner.
+    """
+    protocol_version: str = "v2"
+    id: str = ""
+    name: str = ""
+
+    # AI's reasoning
+    hypothesis: str = ""
+    simulated_scenario: Optional[str] = None
+
+    # Execution
+    execution_plan: Optional[ExecutionPlan] = None
+    telemetry_requirements: List[TelemetryRequirement] = field(default_factory=list)
+    success_criteria: Optional[SuccessCriteria] = None
+
+    # Metadata
+    metadata: Optional[StrategyMetadata] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        def convert(obj):
+            if obj is None:
+                return None
+            if hasattr(obj, '__dataclass_fields__'):
+                result = {}
+                for k, v in asdict(obj).items():
+                    converted = convert(v)
+                    if converted is not None:
+                        result[k] = converted
+                return result
+            elif isinstance(obj, list):
+                return [convert(i) for i in obj]
+            elif isinstance(obj, dict):
+                return {k: convert(v) for k, v in obj.items() if v is not None}
+            return obj
+        return convert(self)
+
+    def to_json(self, indent: int = 2) -> str:
+        """Serialize to JSON string."""
+        return json.dumps(self.to_dict(), indent=indent)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "StrategyDefinition":
+        """Create from dictionary (parsed from AI response)."""
+        # Handle nested dataclasses
+        if "execution_plan" in data and data["execution_plan"]:
+            ep = data["execution_plan"]
+            if "setup" in ep and ep["setup"]:
+                ep["setup"] = SetupTeardown(**ep["setup"])
+            if "benchmark" in ep and ep["benchmark"]:
+                ep["benchmark"] = BenchmarkConfig(**ep["benchmark"])
+            if "teardown" in ep and ep["teardown"]:
+                ep["teardown"] = SetupTeardown(**ep["teardown"])
+            data["execution_plan"] = ExecutionPlan(**ep)
+
+        if "telemetry_requirements" in data:
+            def normalize_telemetry(t: dict) -> TelemetryRequirement:
+                # Handle field name variations from AI
+                if "metrics" in t and "metric_keys" not in t:
+                    t["metric_keys"] = t.pop("metrics")
+                # Filter to only valid fields
+                valid_fields = {"source", "metric_keys", "sampling_interval_ms"}
+                filtered = {k: v for k, v in t.items() if k in valid_fields}
+                return TelemetryRequirement(**filtered)
+
+            data["telemetry_requirements"] = [
+                normalize_telemetry(t) if isinstance(t, dict) else t
+                for t in data["telemetry_requirements"]
+            ]
+
+        if "success_criteria" in data and data["success_criteria"]:
+            data["success_criteria"] = SuccessCriteria(**data["success_criteria"])
+
+        if "metadata" in data and data["metadata"]:
+            data["metadata"] = StrategyMetadata(**data["metadata"])
+
+        return cls(**data)
+
+    def get_clients_list(self) -> List[int]:
+        """Get clients as a list (handles both int and list)."""
+        if self.execution_plan and self.execution_plan.benchmark:
+            clients = self.execution_plan.benchmark.clients
+            if isinstance(clients, int):
+                return [clients]
+            return clients
+        return [10]  # Default
+
+    def validate(self) -> List[str]:
+        """Validate the SDL and return list of violations."""
+        violations = []
+
+        if not self.id:
+            violations.append("Missing strategy ID")
+        if not self.hypothesis:
+            violations.append("Missing hypothesis")
+
+        if self.execution_plan and self.execution_plan.benchmark:
+            bench = self.execution_plan.benchmark
+            clients_list = self.get_clients_list()
+
+            # Check resource limits
+            if max(clients_list) > 500:
+                violations.append(f"clients ({max(clients_list)}) exceeds max (500)")
+            if bench.duration_sec > 300:
+                violations.append(f"duration_sec ({bench.duration_sec}) exceeds max (300)")
+            if bench.sql_template and len(bench.sql_template) > 5120:
+                violations.append(f"sql_template size ({len(bench.sql_template)}) exceeds max (5KB)")
+
+        return violations

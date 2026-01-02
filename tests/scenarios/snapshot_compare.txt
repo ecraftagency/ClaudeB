@@ -1,0 +1,49 @@
+# Snapshot Comparison Test Scenario
+# Tests: comparing snapshots to see differences
+#
+# Expected flow:
+# 1. Start session, run baseline
+# 2. Apply first tuning, create checkpoint
+# 3. Apply second tuning, create checkpoint
+# 4. Compare initial vs first checkpoint
+# 5. Compare first vs second checkpoint
+
+# Start session
+/go
+
+# Run baseline
+/run
+
+# Accept target
+/accept
+
+# Apply first round
+/apply
+
+# Run benchmark
+/run
+
+# Create first checkpoint
+/snapshot after-round-1
+
+# Apply second round
+/apply
+
+# Run benchmark
+/run
+
+# Create second checkpoint
+/snapshot after-round-2
+
+# Compare initial vs after-round-1
+/snapshot compare initial after-round-1
+
+# Compare after-round-1 vs after-round-2
+/snapshot compare after-round-1 after-round-2
+
+# Show snapshot details
+/snapshot show initial
+/snapshot show after-round-1
+
+# Exit
+/quit

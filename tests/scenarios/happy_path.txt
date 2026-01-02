@@ -1,0 +1,34 @@
+# Happy Path Test Scenario
+# Tests complete tuning flow from start to target achieved
+# Expected: Baseline -> Round 1 -> Round 2 -> Round 3 -> Target Achieved
+
+# Start with default strategy (first option)
+/go
+
+# Accept the benchmark configuration
+/run
+
+# Accept the suggested target
+/accept
+
+# Apply first round tuning
+/apply
+
+# Run round 1 benchmark
+/run
+
+# Apply round 2 tuning
+/apply
+
+# Run round 2 benchmark
+/run
+
+# Apply round 3 tuning
+/apply
+
+# Run round 3 benchmark
+/run
+
+# Session should conclude with target achieved
+# Exit cleanly
+/quit

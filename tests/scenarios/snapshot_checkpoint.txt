@@ -1,0 +1,40 @@
+# Checkpoint Snapshot Test Scenario
+# Tests: manual checkpoint creation, restore to checkpoint
+#
+# Expected flow:
+# 1. Start session, run baseline, accept target
+# 2. Apply first tuning, run benchmark
+# 3. Create checkpoint 'good-memory'
+# 4. Apply more tuning, run benchmark
+# 5. Results worse, restore to checkpoint
+# 6. Continue from checkpoint state
+
+# Start with default strategy
+/go
+
+# Run baseline
+/run
+
+# Accept target
+/accept
+
+# Apply first round (memory tuning)
+/apply
+
+# Run benchmark - expect improvement
+/run
+
+# Save this good state as checkpoint
+/snapshot good-memory
+
+# Apply second round (more aggressive tuning)
+/apply
+
+# Run benchmark - might be worse
+/run
+
+# Results didn't improve, restore to good checkpoint
+/restore good-memory
+
+# Exit
+/quit
