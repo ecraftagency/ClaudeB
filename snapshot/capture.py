@@ -124,30 +124,40 @@ class SnapshotCapture:
         Read postgresql.auto.conf contents.
 
         This file contains ALTER SYSTEM settings.
+        Returns empty string if file is not accessible (permission denied, remote, etc.)
         """
         auto_conf_path = f"{self.data_directory}/postgresql.auto.conf"
 
         if self.is_remote:
             return self._read_remote_file(auto_conf_path)
         else:
-            path = Path(auto_conf_path)
-            if path.exists():
-                return path.read_text()
-            return ""
+            try:
+                path = Path(auto_conf_path)
+                if path.exists():
+                    return path.read_text()
+                return ""
+            except (PermissionError, OSError):
+                # File exists but not readable (e.g., connecting via proxy to remote DB)
+                return ""
 
     def _capture_conf_hash(self) -> str:
         """
         Get MD5 hash of postgresql.conf to detect manual edits.
+        Returns hash of empty string if file is not accessible.
         """
         conf_path = f"{self.data_directory}/postgresql.conf"
 
         if self.is_remote:
             content = self._read_remote_file(conf_path)
         else:
-            path = Path(conf_path)
-            if path.exists():
-                content = path.read_text()
-            else:
+            try:
+                path = Path(conf_path)
+                if path.exists():
+                    content = path.read_text()
+                else:
+                    content = ""
+            except (PermissionError, OSError):
+                # File exists but not readable (e.g., connecting via proxy to remote DB)
                 content = ""
 
         return hashlib.md5(content.encode()).hexdigest()
