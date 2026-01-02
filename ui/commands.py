@@ -71,8 +71,12 @@ class SlashCommandHandler:
         }
 
     def is_command(self, input_text: str) -> bool:
-        """Check if input is a slash command."""
-        return input_text.strip().startswith('/')
+        """Check if input is a recognized slash command."""
+        if not input_text.strip().startswith('/'):
+            return False
+        # Only return True if this is a command we handle
+        command, _ = self.parse(input_text)
+        return command in self._commands
 
     def parse(self, input_text: str) -> Tuple[str, List[str]]:
         """Parse command and arguments from input."""

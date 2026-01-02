@@ -12,9 +12,52 @@ import warnings
 import time
 import threading
 import subprocess
+import readline
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, field
 from datetime import datetime
+
+
+# ===== Tab Completion for Commands =====
+class CommandCompleter:
+    """Tab completion for slash commands."""
+
+    def __init__(self, commands: List[str] = None):
+        self.commands = commands or []
+        self.matches = []
+
+    def set_commands(self, commands: List[str]):
+        """Update available commands for current context."""
+        self.commands = commands
+
+    def complete(self, text: str, state: int):
+        """Readline completer function."""
+        if state == 0:
+            # First call - build match list
+            if text.startswith('/'):
+                # Match against commands
+                self.matches = [c for c in self.commands if c.startswith(text)]
+            elif text == '':
+                # Show all commands on empty tab
+                self.matches = self.commands.copy()
+            else:
+                self.matches = []
+
+        # Return match or None
+        if state < len(self.matches):
+            return self.matches[state]
+        return None
+
+
+# Global completer instance
+_completer = CommandCompleter()
+
+def setup_tab_completion(commands: List[str]):
+    """Setup readline tab completion with given commands."""
+    _completer.set_commands(commands)
+    readline.set_completer(_completer.complete)
+    readline.set_completer_delims(' \t\n')
+    readline.parse_and_bind('tab: complete')
 
 from .commands import SessionState, CommandHandler, create_command_handler
 from .dashboard import ProgressTimeline, DiffView, SafetyDisplay
@@ -24,6 +67,7 @@ from .workspace import (
     SessionPhase, SessionStateMachine, InvalidStateTransition
 )
 from .ui import SlashCommandHandler, CommandResult, StatusLineManager
+from .config import Config
 
 # Suppress Google API warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="google")
@@ -77,7 +121,20 @@ Examples:
 Environment Variables:
     GEMINI_API_KEY    Gemini API key (required)
     PGPASSWORD        PostgreSQL password
+
+Config File:
+    pg_diagnose automatically loads config.toml from:
+    1. ./pg_diagnose/config.toml (project root)
+    2. ./config.toml (current directory)
+    3. ~/.pg_diagnose/config.toml
+    4. ~/.config/pg_diagnose/config.toml
         """,
+    )
+
+    # Config file
+    parser.add_argument(
+        "-c", "--config",
+        help="Path to TOML config file (auto-detected if not specified)"
     )
 
     # Database connection
@@ -297,15 +354,43 @@ class DiagnoseUI:
             self.status_line_manager.update_from_workspace(self.workspace_manager)
             self.status_line_manager.show()
 
-    def prompt(self, message: str, allow_commands: bool = True) -> str:
+    def prompt(self, message: str, allow_commands: bool = True, tab_commands: List[str] = None, default: str = None) -> str:
         """
-        Get user input with optional slash command support.
+        Get user input with optional slash command support and tab completion.
 
         If input starts with '/', it's processed as a command and
         this method prompts again for actual input.
+
+        Unrecognized commands are returned to the caller for handling.
+
+        Args:
+            message: Prompt message to display
+            allow_commands: Whether to process slash commands
+            tab_commands: List of commands for tab completion (e.g., ['/go', '/done', '/custom'])
+            default: Default command to return if user presses Enter (shown in prompt)
         """
+        # Setup tab completion if commands provided
+        if tab_commands:
+            setup_tab_completion(tab_commands)
+        else:
+            # Default commands for general prompts
+            setup_tab_completion(['/help', '/status', '/quit', '/pause'])
+
+        # Build prompt message with default hint
+        if default:
+            display_message = f"[{default}]: "
+        else:
+            display_message = message
+
         while True:
-            user_input = input(message).strip()
+            try:
+                user_input = input(display_message).strip()
+            except EOFError:
+                return '/quit'
+
+            # Return default if user just presses Enter
+            if not user_input and default:
+                return default
 
             # Check for slash commands
             if allow_commands and user_input.startswith('/'):
@@ -319,10 +404,12 @@ class DiagnoseUI:
 
                     continue  # Prompt again after command
 
-                # Fall back to legacy command handler
-                if self.command_handler:
+                # Fall back to legacy command handler (only if it recognizes the command)
+                if self.command_handler and self.command_handler.has_command(user_input):
                     self.command_handler.parse_and_execute(user_input)
                     continue  # Prompt again after command
+
+                # Unrecognized command - return to caller for context-specific handling
 
             return user_input
 
@@ -523,7 +610,7 @@ class DiagnoseUI:
         self.show_context_menu('strategy_custom')
 
         while True:
-            cmd = self.prompt("> ").strip().lower()
+            cmd = self.prompt("> ", default="/go").strip().lower()
 
             if cmd in ['/go', '/g', '']:
                 return None  # Continue without custom instructions
@@ -594,9 +681,9 @@ class DiagnoseUI:
         self.show_context_menu('benchmark_confirm')
 
         while True:
-            cmd = self.prompt("> ").strip().lower()
+            cmd = self.prompt("> ", default="/run").strip().lower()
 
-            if cmd in ['/run', '/r', 'y', 'yes']:
+            if cmd in ['/run', '/r', 'y', 'yes', '']:
                 return True
 
             if cmd in ['/quit', '/q']:
@@ -608,7 +695,7 @@ class DiagnoseUI:
             if cmd in ['/skip', '/s']:
                 return 'SKIP'
 
-            if cmd in ['n', 'no', '']:
+            if cmd in ['n', 'no']:
                 return False
 
             self.print(f"[yellow]Unknown command: {cmd}. Type /run to execute or /skip to skip.[/]" if self.console else f"Unknown command: {cmd}")
@@ -778,29 +865,26 @@ class DiagnoseUI:
             # PostgreSQL tuning
             if config.tuning_chunks:
                 self.console.print("\n[cyan]PostgreSQL Configuration Changes:[/]")
-                table = Table(box=box.ROUNDED, show_header=True)
+                table = Table(box=box.ROUNDED, show_header=True, expand=True, width=120)
                 table.add_column("#", style="cyan", width=3)
-                table.add_column("Name", style="green")
-                table.add_column("Category", style="yellow")
-                table.add_column("Restart", style="red")
+                table.add_column("Name", style="green", width=30)
+                table.add_column("Category", style="yellow", width=10)
+                table.add_column("SQL Commands", style="cyan", width=65, overflow="fold")
+                table.add_column("Restart", style="red", width=7)
 
                 for i, chunk in enumerate(config.tuning_chunks, 1):
                     restart = "[red]Yes[/]" if chunk.requires_restart else "[green]No[/]"
-                    table.add_row(str(i), chunk.name, chunk.category, restart)
+                    # Extract ALTER SYSTEM commands
+                    sql_cmds = [cmd for cmd in chunk.apply_commands if 'ALTER SYSTEM SET' in cmd.upper()]
+                    sql_text = "\n".join(sql_cmds) if sql_cmds else "-"
+                    table.add_row(str(i), chunk.name, chunk.category, sql_text, restart)
 
                 self.console.print(table)
 
-                # Show details with specific config flags
+                # Show descriptions below table
                 for chunk in config.tuning_chunks:
-                    self.console.print(f"\n  [bold]{chunk.name}:[/]")
                     if chunk.description:
-                        self.console.print(f"    [dim]{chunk.description}[/]")
-                    # Show all ALTER SYSTEM commands prominently
-                    for cmd in chunk.apply_commands:
-                        if 'ALTER SYSTEM SET' in cmd.upper():
-                            self.console.print(f"    [yellow]→ {cmd}[/]")
-                        elif 'pg_reload_conf' not in cmd.lower():
-                            self.console.print(f"    [dim]→ {cmd}[/]")
+                        self.console.print(f"\n  [bold]{chunk.name}:[/] [dim]{chunk.description}[/]")
 
             # OS tuning
             if config.os_tuning:
@@ -903,12 +987,12 @@ class DiagnoseUI:
         self.console.rule("[bold blue]Schema Overview[/]")
         self.console.print(response.schema_overview)
 
-        # Key Observations
+        # Key Observations (issues/areas needing attention)
         if response.key_observations:
             self.console.print()
-            self.console.rule("[bold blue]Key Observations[/]")
+            self.console.rule("[bold yellow]Key Observations[/]")
             for obs in response.key_observations:
-                self.console.print(f"  [green]•[/] {obs}")
+                self.console.print(f"  [yellow]•[/] {obs}")
 
         # Warnings
         if response.warnings:
@@ -1042,6 +1126,10 @@ def run_discovery(conn, ssh_config: Optional[Dict] = None):
     from .protocol.context import ContextPacket
     from datetime import datetime
 
+    # Get PostgreSQL version first (needed for system context)
+    runtime_scanner_temp = RuntimeScanner(conn, None)
+    pg_version, pg_version_full = runtime_scanner_temp.get_version()
+
     # System scanner
     sys_config = None
     if ssh_config:
@@ -1052,7 +1140,7 @@ def run_discovery(conn, ssh_config: Optional[Dict] = None):
             ssh_key=ssh_config.get('key'),
         )
     system_scanner = SystemScanner(config=sys_config)
-    system_context = system_scanner.scan()
+    system_context = system_scanner.scan(pg_version=pg_version, pg_version_full=pg_version_full)
 
     # Schema scanner
     schema_scanner = SchemaScanner(conn)
@@ -1105,6 +1193,84 @@ def get_db_config(conn) -> Dict[str, str]:
     return config
 
 
+def create_live_benchmark_table(
+    elapsed: float,
+    duration: float,
+    tps: float,
+    latency: float,
+    cpu_user: float,
+    cpu_sys: float,
+    cpu_wait: float,
+    mem_free_mb: float,
+    disk_util: float,
+    disk_await: float,
+    cache_hit_ratio: float,
+    buffers_backend: int,
+    buffers_clean: int,
+    buffers_checkpoint: int,
+) -> Table:
+    """Create a live benchmark metrics table."""
+    from rich.table import Table
+    from rich import box
+
+    # Progress percentage
+    pct = min(elapsed / duration * 100, 100) if duration > 0 else 0
+    remaining = max(0, duration - elapsed)
+
+    # Main table
+    table = Table(
+        title=f"[bold cyan]Benchmark[/] [dim]({elapsed:.0f}s / {duration:.0f}s)[/] [{'green' if pct >= 100 else 'yellow'}]{pct:.0f}%[/]",
+        box=box.ROUNDED,
+        show_header=False,
+        padding=(0, 1),
+        expand=False,
+    )
+    table.add_column("Category", style="dim", width=14)
+    table.add_column("Metric", width=45)
+
+    # TPS & Latency row
+    tps_color = "green" if tps > 0 else "dim"
+    lat_color = "green" if latency > 0 and latency < 20 else "yellow" if latency < 50 else "red"
+    table.add_row(
+        "Performance",
+        f"[bold {tps_color}]TPS: {tps:,.0f}[/]  [dim]|[/]  [bold {lat_color}]Latency: {latency:.1f}ms[/]"
+    )
+
+    # CPU row
+    cpu_total = cpu_user + cpu_sys
+    cpu_color = "green" if cpu_total < 70 else "yellow" if cpu_total < 90 else "red"
+    wait_color = "green" if cpu_wait < 10 else "yellow" if cpu_wait < 30 else "red"
+    table.add_row(
+        "CPU",
+        f"[{cpu_color}]User: {cpu_user:.0f}%  Sys: {cpu_sys:.0f}%[/]  [dim]|[/]  [{wait_color}]Wait: {cpu_wait:.0f}%[/]"
+    )
+
+    # Disk row
+    disk_color = "green" if disk_util < 70 else "yellow" if disk_util < 90 else "red"
+    await_color = "green" if disk_await < 5 else "yellow" if disk_await < 20 else "red"
+    table.add_row(
+        "Disk I/O",
+        f"[{disk_color}]Util: {disk_util:.0f}%[/]  [dim]|[/]  [{await_color}]Await: {disk_await:.1f}ms[/]"
+    )
+
+    # Cache row
+    cache_color = "green" if cache_hit_ratio > 95 else "yellow" if cache_hit_ratio > 80 else "red"
+    cache_miss = 100 - cache_hit_ratio
+    table.add_row(
+        "Buffer Cache",
+        f"[{cache_color}]Hit: {cache_hit_ratio:.1f}%  Miss: {cache_miss:.1f}%[/]"
+    )
+
+    # Buffer writer row
+    backend_color = "green" if buffers_backend == 0 else "yellow" if buffers_backend < 100 else "red"
+    table.add_row(
+        "Buffer Writers",
+        f"[{backend_color}]Backend: {buffers_backend}[/]  [dim]|[/]  BGWriter: {buffers_clean}  [dim]|[/]  Checkpoint: {buffers_checkpoint}"
+    )
+
+    return table
+
+
 def run_benchmark_with_telemetry(
     conn,
     strategy,
@@ -1118,7 +1284,7 @@ def run_benchmark_with_telemetry(
     session_state: Optional['SessionState'] = None,
     round_num: int = 0,
 ) -> Dict[str, Any]:
-    """Run benchmark with concurrent telemetry collection.
+    """Run benchmark with concurrent telemetry collection and live display.
 
     Args:
         conn: Database connection
@@ -1130,6 +1296,7 @@ def run_benchmark_with_telemetry(
         round_num: Current tuning round number (for mock TPS progression)
     """
     from .telemetry.collector import TelemetryCollector
+    import re
 
     # Check if we should use mock benchmark
     use_mock_benchmark = (
@@ -1156,21 +1323,117 @@ def run_benchmark_with_telemetry(
     result = {'tps': 0, 'latency_avg_ms': 0, 'latency_p99_ms': 0, 'transactions': 0}
     telemetry_data = {'pg_stats': [], 'iostat': [], 'vmstat': []}
 
+    # Live metrics state
+    live_metrics = {
+        'tps': 0.0,
+        'latency': 0.0,
+        'cpu_user': 0.0,
+        'cpu_sys': 0.0,
+        'cpu_wait': 0.0,
+        'mem_free_mb': 0.0,
+        'disk_util': 0.0,
+        'disk_await': 0.0,
+        'cache_hit_ratio': 99.9,
+        'buffers_backend': 0,
+        'buffers_clean': 0,
+        'buffers_checkpoint': 0,
+        # Track baseline for delta
+        'baseline_bgwriter': None,
+    }
+
     # Start telemetry collection in background
     telemetry_stop = threading.Event()
     telemetry_thread = None
 
     def collect_telemetry():
+        # Debug: log ssh_config
+        import sys
+        if ssh_config:
+            print(f"[TELEMETRY] SSH config: host={ssh_config.get('host')}, user={ssh_config.get('user')}", file=sys.stderr, flush=True)
+        else:
+            print("[TELEMETRY] WARNING: ssh_config is None!", file=sys.stderr, flush=True)
+
         collector = TelemetryCollector(connection=conn, ssh_config=ssh_config)
+        collection_errors = []
+        debug_count = 0
         while not telemetry_stop.is_set():
             try:
                 snapshot = collector.collect_snapshot()
-                telemetry_data['pg_stats'].append(snapshot.get('pg_stats', {}))
-                telemetry_data['iostat'].append(snapshot.get('iostat', {}))
-                telemetry_data['vmstat'].append(snapshot.get('vmstat', {}))
-            except Exception:
-                pass
+
+                # Update live metrics
+                pg_stats = snapshot.get('pg_stats', {})
+                iostat = snapshot.get('iostat', {})
+                vmstat = snapshot.get('vmstat', {})
+
+                # Debug first 2 collections
+                if debug_count < 2:
+                    print(f"[TELEMETRY] vmstat={vmstat}", file=sys.stderr, flush=True)
+                    print(f"[TELEMETRY] iostat keys={list(iostat.keys())[:5]}", file=sys.stderr, flush=True)
+                    debug_count += 1
+
+                # CPU from vmstat (nested structure: vmstat.cpu.user_pct)
+                vmstat_cpu = vmstat.get('cpu', {})
+                live_metrics['cpu_user'] = vmstat_cpu.get('user_pct', 0)
+                live_metrics['cpu_sys'] = vmstat_cpu.get('system_pct', 0)
+                live_metrics['cpu_wait'] = vmstat_cpu.get('wait_pct', 0)
+                vmstat_mem = vmstat.get('memory', {})
+                live_metrics['mem_free_mb'] = vmstat_mem.get('free_kb', 0) / 1024
+
+                # Disk from iostat - returns dict of {device_name: {util_pct, await_ms, ...}}
+                if isinstance(iostat, dict) and iostat:
+                    # Get max utilization across all devices
+                    max_util = 0
+                    max_await = 0
+                    for dev_name, dev_stats in iostat.items():
+                        if isinstance(dev_stats, dict):
+                            util = dev_stats.get('util_pct', 0)
+                            await_ms = dev_stats.get('await_ms', 0)
+                            if util > max_util:
+                                max_util = util
+                                max_await = await_ms
+                    live_metrics['disk_util'] = max_util
+                    live_metrics['disk_await'] = max_await
+
+                # Cache hit from pg_stat_database
+                db_stats = pg_stats.get('database', {})
+                live_metrics['cache_hit_ratio'] = db_stats.get('cache_hit_ratio', 99.9)
+
+                # BGWriter stats - track delta (cumulative counters)
+                bgwriter = pg_stats.get('bgwriter', {})
+                current_backend = bgwriter.get('buffers_backend', 0) or 0
+                current_clean = bgwriter.get('buffers_clean', 0) or 0
+                current_checkpoint = bgwriter.get('buffers_checkpoint', 0) or 0
+
+                # Initialize or reset baseline (handles PostgreSQL restarts)
+                if live_metrics['baseline_bgwriter'] is None:
+                    live_metrics['baseline_bgwriter'] = bgwriter.copy()
+
+                base = live_metrics['baseline_bgwriter']
+                base_backend = base.get('buffers_backend', 0) or 0
+                base_clean = base.get('buffers_clean', 0) or 0
+                base_checkpoint = base.get('buffers_checkpoint', 0) or 0
+
+                # Detect counter reset (current < baseline means PG restarted)
+                if current_backend < base_backend or current_clean < base_clean or current_checkpoint < base_checkpoint:
+                    # Reset baseline to current values
+                    live_metrics['baseline_bgwriter'] = bgwriter.copy()
+                    base_backend = current_backend
+                    base_clean = current_clean
+                    base_checkpoint = current_checkpoint
+
+                live_metrics['buffers_backend'] = current_backend - base_backend
+                live_metrics['buffers_clean'] = current_clean - base_clean
+                live_metrics['buffers_checkpoint'] = current_checkpoint - base_checkpoint
+
+                # Store for later
+                telemetry_data['pg_stats'].append(pg_stats)
+                telemetry_data['iostat'].append(iostat)
+                telemetry_data['vmstat'].append(vmstat)
+            except Exception as e:
+                collection_errors.append(str(e))
             time.sleep(1)
+        # Store errors for debugging
+        telemetry_data['_errors'] = collection_errors[:5]  # Keep first 5 errors
 
     try:
         # Start telemetry thread (skip in mock mode - no real telemetry needed)
@@ -1178,44 +1441,71 @@ def run_benchmark_with_telemetry(
             telemetry_thread = threading.Thread(target=collect_telemetry, daemon=True)
             telemetry_thread.start()
 
-        # Show progress while benchmark runs
+        # Show live metrics while benchmark runs
         if ui.console and RICH_AVAILABLE:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-                TimeElapsedColumn(),
-                console=ui.console,
-            ) as progress:
-                task = progress.add_task("[cyan]Running benchmark...", total=duration)
+            from rich.live import Live
 
-                # Start benchmark in background
-                bench_result = [None]
-                bench_error = [None]
+            # Callback for real-time TPS updates from pgbench progress
+            def on_progress(tps: float, latency: float):
+                live_metrics['tps'] = tps
+                live_metrics['latency'] = latency
 
-                def run_bench():
-                    try:
+            # Start benchmark in background with streaming callback
+            bench_result = [None]
+            bench_error = [None]
+
+            def run_bench():
+                try:
+                    # Pass callback for real-time TPS updates
+                    if not use_mock_benchmark:
+                        bench_result[0] = runner.run(strategy, progress_callback=on_progress)
+                    else:
                         bench_result[0] = runner.run(strategy)
-                    except Exception as e:
-                        bench_error[0] = e
+                except Exception as e:
+                    bench_error[0] = e
 
-                bench_thread = threading.Thread(target=run_bench)
-                bench_thread.start()
+            bench_thread = threading.Thread(target=run_bench)
+            bench_thread.start()
 
-                # Update progress
-                start_time = time.time()
+            # Live display with metrics
+            start_time = time.time()
+
+            with Live(console=ui.console, refresh_per_second=2) as live:
                 while bench_thread.is_alive():
                     elapsed = time.time() - start_time
-                    progress.update(task, completed=min(elapsed, duration))
+
+                    # Create and update table
+                    table = create_live_benchmark_table(
+                        elapsed=elapsed,
+                        duration=duration,
+                        tps=live_metrics['tps'],
+                        latency=live_metrics['latency'],
+                        cpu_user=live_metrics['cpu_user'],
+                        cpu_sys=live_metrics['cpu_sys'],
+                        cpu_wait=live_metrics['cpu_wait'],
+                        mem_free_mb=live_metrics['mem_free_mb'],
+                        disk_util=live_metrics['disk_util'],
+                        disk_await=live_metrics['disk_await'],
+                        cache_hit_ratio=live_metrics['cache_hit_ratio'],
+                        buffers_backend=live_metrics['buffers_backend'],
+                        buffers_clean=live_metrics['buffers_clean'],
+                        buffers_checkpoint=live_metrics['buffers_checkpoint'],
+                    )
+                    live.update(table)
                     time.sleep(0.5)
 
-                bench_thread.join()
-                progress.update(task, completed=duration)
+            bench_thread.join()
 
-                if bench_error[0]:
-                    raise bench_error[0]
-                result = bench_result[0]
+            if bench_error[0]:
+                raise bench_error[0]
+            result = bench_result[0]
+
+            # Show final result
+            if result and hasattr(result, 'metrics') and result.metrics:
+                final_tps = result.metrics.tps or 0
+                final_lat = result.metrics.latency_avg_ms or 0
+                ui.console.print(f"[bold green]✓ Benchmark complete[/] - TPS: {final_tps:,.0f}  Latency: {final_lat:.1f}ms")
+
         else:
             ui.print(f"Running benchmark ({duration}s)...")
             result = runner.run(strategy)
@@ -1233,114 +1523,340 @@ def run_benchmark_with_telemetry(
 
 def format_telemetry_summary(telemetry: Dict) -> str:
     """
-    Format telemetry data into a summary string for AI.
+    Format telemetry data into a comprehensive summary string for AI.
 
-    Includes both aggregated stats AND time series data so AI can see patterns
-    like performance cliffs, checkpoint spikes, etc.
+    Includes ALL collected metrics as time series for pattern detection:
+    - OS: CPU, Memory, Disk I/O, Swap
+    - PostgreSQL: Cache, BGWriter, WAL, Connections, Activity, Locks
     """
     lines = []
 
-    # --- Aggregated Summary ---
-    lines.append("=== AGGREGATED METRICS ===")
+    pg_stats_list = telemetry.get('pg_stats', [])
+    iostat_list = telemetry.get('iostat', [])
+    vmstat_list = telemetry.get('vmstat', [])
 
-    pg_stats = telemetry.get('pg_stats', [])
-    if pg_stats:
-        avg_cache_hit = sum(s.get('cache_hit_ratio', 0) for s in pg_stats) / len(pg_stats) if pg_stats else 0
-        min_cache_hit = min((s.get('cache_hit_ratio', 100) for s in pg_stats), default=0)
-        lines.append(f"PG Cache Hit: avg={avg_cache_hit:.2f}%, min={min_cache_hit:.2f}%")
+    # Helper to safely get nested dict value
+    def get_nested(d, *keys, default=0):
+        for key in keys:
+            if isinstance(d, dict):
+                d = d.get(key, {})
+            else:
+                return default
+        return d if d != {} else default
 
-    iostat = telemetry.get('iostat', [])
-    if iostat:
-        avg_util = sum(s.get('util', 0) for s in iostat) / len(iostat) if iostat else 0
-        max_util = max((s.get('util', 0) for s in iostat), default=0)
-        avg_await = sum(s.get('await', 0) for s in iostat) / len(iostat) if iostat else 0
-        max_await = max((s.get('await', 0) for s in iostat), default=0)
-        lines.append(f"IO: avg_util={avg_util:.1f}%, max_util={max_util:.1f}%, avg_await={avg_await:.2f}ms, max_await={max_await:.2f}ms")
+    # Helper to format series
+    def fmt_series(values, fmt=".0f"):
+        return "[" + ", ".join(f"{v:{fmt}}" for v in values) + "]"
 
-    vmstat = telemetry.get('vmstat', [])
-    if vmstat:
-        avg_cpu_user = sum(s.get('cpu_user', 0) for s in vmstat) / len(vmstat) if vmstat else 0
-        avg_cpu_sys = sum(s.get('cpu_sys', 0) for s in vmstat) / len(vmstat) if vmstat else 0
-        avg_cpu_wait = sum(s.get('cpu_wait', 0) for s in vmstat) / len(vmstat) if vmstat else 0
-        max_cpu_wait = max((s.get('cpu_wait', 0) for s in vmstat), default=0)
-        lines.append(f"CPU: avg_user={avg_cpu_user:.1f}%, avg_sys={avg_cpu_sys:.1f}%, avg_wait={avg_cpu_wait:.1f}%, max_wait={max_cpu_wait:.1f}%")
+    # =========================================================================
+    # SECTION 1: OS/HARDWARE METRICS
+    # =========================================================================
+    lines.append("=" * 60)
+    lines.append("OS/HARDWARE METRICS (1-second intervals)")
+    lines.append("=" * 60)
 
-    # --- Time Series Data (for pattern detection) ---
-    lines.append("\n=== TIME SERIES DATA (5-second intervals) ===")
-    lines.append("Format: [T+0s, T+5s, T+10s, ...] - values at each interval")
+    # --- CPU Metrics ---
+    if vmstat_list:
+        lines.append("\n[CPU]")
+        cpu_user = [get_nested(s, 'cpu', 'user_pct', default=s.get('cpu_user', 0)) for s in vmstat_list]
+        cpu_sys = [get_nested(s, 'cpu', 'system_pct', default=s.get('cpu_sys', 0)) for s in vmstat_list]
+        cpu_wait = [get_nested(s, 'cpu', 'wait_pct', default=s.get('cpu_wait', 0)) for s in vmstat_list]
+        cpu_idle = [get_nested(s, 'cpu', 'idle_pct', default=s.get('cpu_idle', 0)) for s in vmstat_list]
 
-    # IO utilization time series
-    if iostat:
-        util_series = [f"{s.get('util', 0):.0f}" for s in iostat]
-        await_series = [f"{s.get('await', 0):.1f}" for s in iostat]
-        read_series = [f"{s.get('r_per_sec', 0):.0f}" for s in iostat]
-        write_series = [f"{s.get('w_per_sec', 0):.0f}" for s in iostat]
-        lines.append(f"IO Utilization %: [{', '.join(util_series)}]")
-        lines.append(f"IO Await ms: [{', '.join(await_series)}]")
-        lines.append(f"Read IOPS: [{', '.join(read_series)}]")
-        lines.append(f"Write IOPS: [{', '.join(write_series)}]")
+        lines.append(f"  User %:   {fmt_series(cpu_user)}")
+        lines.append(f"  System %: {fmt_series(cpu_sys)}")
+        lines.append(f"  Wait %:   {fmt_series(cpu_wait)}")
+        lines.append(f"  Idle %:   {fmt_series(cpu_idle)}")
+        lines.append(f"  Summary: avg_user={sum(cpu_user)/len(cpu_user):.1f}%, avg_sys={sum(cpu_sys)/len(cpu_sys):.1f}%, max_wait={max(cpu_wait):.1f}%")
 
-    # CPU time series
-    if vmstat:
-        cpu_user_series = [f"{s.get('cpu_user', 0):.0f}" for s in vmstat]
-        cpu_sys_series = [f"{s.get('cpu_sys', 0):.0f}" for s in vmstat]
-        cpu_wait_series = [f"{s.get('cpu_wait', 0):.0f}" for s in vmstat]
-        cpu_idle_series = [f"{s.get('cpu_idle', 0):.0f}" for s in vmstat]
-        lines.append(f"CPU User %: [{', '.join(cpu_user_series)}]")
-        lines.append(f"CPU System %: [{', '.join(cpu_sys_series)}]")
-        lines.append(f"CPU Wait %: [{', '.join(cpu_wait_series)}]")
-        lines.append(f"CPU Idle %: [{', '.join(cpu_idle_series)}]")
+    # --- Memory Metrics ---
+    if vmstat_list:
+        lines.append("\n[MEMORY]")
+        mem_free = [get_nested(s, 'memory', 'free_kb', default=s.get('free_kb', 0)) / 1024 for s in vmstat_list]
+        mem_buffer = [get_nested(s, 'memory', 'buffer_kb', default=s.get('buffer_kb', 0)) / 1024 for s in vmstat_list]
+        mem_cache = [get_nested(s, 'memory', 'cache_kb', default=s.get('cache_kb', 0)) / 1024 for s in vmstat_list]
+        mem_swap = [get_nested(s, 'memory', 'swapped_kb', default=s.get('swapped_kb', 0)) / 1024 for s in vmstat_list]
 
-    # Memory/swap time series
-    if vmstat:
-        swap_in_series = [f"{s.get('swap_in', 0):.0f}" for s in vmstat]
-        swap_out_series = [f"{s.get('swap_out', 0):.0f}" for s in vmstat]
-        if any(int(x) > 0 for x in swap_in_series) or any(int(x) > 0 for x in swap_out_series):
-            lines.append(f"Swap In: [{', '.join(swap_in_series)}]")
-            lines.append(f"Swap Out: [{', '.join(swap_out_series)}]")
+        lines.append(f"  Free MB:   {fmt_series(mem_free)}")
+        lines.append(f"  Buffer MB: {fmt_series(mem_buffer)}")
+        lines.append(f"  Cache MB:  {fmt_series(mem_cache)}")
+        if max(mem_swap) > 0:
+            lines.append(f"  Swap MB:   {fmt_series(mem_swap)}")
 
-    # PG stats time series (cache hit ratio over time)
-    if pg_stats:
-        cache_hit_series = [f"{s.get('cache_hit_ratio', 0):.1f}" for s in pg_stats]
-        lines.append(f"PG Cache Hit %: [{', '.join(cache_hit_series)}]")
+        # Swap activity
+        swap_in = [get_nested(s, 'swap', 'in_per_sec', default=s.get('swap_in', 0)) for s in vmstat_list]
+        swap_out = [get_nested(s, 'swap', 'out_per_sec', default=s.get('swap_out', 0)) for s in vmstat_list]
+        if max(swap_in) > 0 or max(swap_out) > 0:
+            lines.append(f"  Swap In/s:  {fmt_series(swap_in)}")
+            lines.append(f"  Swap Out/s: {fmt_series(swap_out)}")
 
-    # Detect and highlight anomalies
-    lines.append("\n=== ANOMALY DETECTION ===")
+    # --- Disk I/O Metrics ---
+    if iostat_list:
+        lines.append("\n[DISK I/O]")
+        # Handle both dict-of-devices and flat dict formats
+        def get_io_val(s, key):
+            if isinstance(s, dict):
+                # Check if it's nested by device
+                for dev in ['nvme0n1', 'sda', 'xvda', 'vda']:
+                    if dev in s:
+                        return s[dev].get(key, 0)
+                # Flat dict
+                return s.get(key, 0)
+            return 0
+
+        io_util = [get_io_val(s, 'util_pct') or get_io_val(s, 'util') for s in iostat_list]
+        io_await = [get_io_val(s, 'await_ms') or get_io_val(s, 'await') for s in iostat_list]
+        io_r_await = [get_io_val(s, 'r_await_ms') or get_io_val(s, 'r_await') for s in iostat_list]
+        io_w_await = [get_io_val(s, 'w_await_ms') or get_io_val(s, 'w_await') for s in iostat_list]
+        io_read = [get_io_val(s, 'r_per_sec') for s in iostat_list]
+        io_write = [get_io_val(s, 'w_per_sec') for s in iostat_list]
+        io_rkb = [get_io_val(s, 'rkb_per_sec') / 1024 for s in iostat_list]  # Convert to MB
+        io_wkb = [get_io_val(s, 'wkb_per_sec') / 1024 for s in iostat_list]
+
+        lines.append(f"  Util %:       {fmt_series(io_util)}")
+        lines.append(f"  Await ms:     {fmt_series(io_await, '.1f')}")
+        lines.append(f"  R_Await ms:   {fmt_series(io_r_await, '.1f')}")
+        lines.append(f"  W_Await ms:   {fmt_series(io_w_await, '.1f')}")
+        lines.append(f"  Read IOPS:    {fmt_series(io_read)}")
+        lines.append(f"  Write IOPS:   {fmt_series(io_write)}")
+        lines.append(f"  Read MB/s:    {fmt_series(io_rkb, '.1f')}")
+        lines.append(f"  Write MB/s:   {fmt_series(io_wkb, '.1f')}")
+        lines.append(f"  Summary: avg_util={sum(io_util)/len(io_util):.1f}%, max_util={max(io_util):.1f}%, avg_await={sum(io_await)/len(io_await):.1f}ms, max_await={max(io_await):.1f}ms")
+
+    # --- Context Switches & Interrupts ---
+    if vmstat_list:
+        lines.append("\n[SYSTEM]")
+        ctx_switches = [get_nested(s, 'system', 'context_switches', default=s.get('cs', 0)) for s in vmstat_list]
+        interrupts = [get_nested(s, 'system', 'interrupts', default=s.get('in', 0)) for s in vmstat_list]
+        procs_run = [get_nested(s, 'procs', 'runnable', default=s.get('r', 0)) for s in vmstat_list]
+        procs_block = [get_nested(s, 'procs', 'blocked', default=s.get('b', 0)) for s in vmstat_list]
+
+        lines.append(f"  Context Switches/s: {fmt_series(ctx_switches)}")
+        lines.append(f"  Interrupts/s:       {fmt_series(interrupts)}")
+        lines.append(f"  Procs Runnable:     {fmt_series(procs_run)}")
+        lines.append(f"  Procs Blocked:      {fmt_series(procs_block)}")
+
+    # =========================================================================
+    # SECTION 2: POSTGRESQL METRICS
+    # =========================================================================
+    lines.append("\n" + "=" * 60)
+    lines.append("POSTGRESQL METRICS (1-second intervals)")
+    lines.append("=" * 60)
+
+    if pg_stats_list:
+        # --- Buffer Cache ---
+        lines.append("\n[BUFFER CACHE]")
+        cache_hit = [get_nested(s, 'database', 'cache_hit_ratio', default=0) for s in pg_stats_list]
+        blks_hit = [get_nested(s, 'database', 'blks_hit', default=0) for s in pg_stats_list]
+        blks_read = [get_nested(s, 'database', 'blks_read', default=0) for s in pg_stats_list]
+
+        lines.append(f"  Cache Hit %:  {fmt_series(cache_hit, '.1f')}")
+        lines.append(f"  Blocks Hit:   {fmt_series(blks_hit)}")
+        lines.append(f"  Blocks Read:  {fmt_series(blks_read)}")
+        lines.append(f"  Summary: avg_hit={sum(cache_hit)/len(cache_hit):.2f}%, min_hit={min(cache_hit):.2f}%")
+
+        # --- BGWriter Stats (cumulative -> compute deltas) ---
+        lines.append("\n[BGWRITER]")
+        buf_backend = [get_nested(s, 'bgwriter', 'buffers_backend', default=0) for s in pg_stats_list]
+        buf_clean = [get_nested(s, 'bgwriter', 'buffers_clean', default=0) for s in pg_stats_list]
+        buf_checkpoint = [get_nested(s, 'bgwriter', 'buffers_checkpoint', default=0) for s in pg_stats_list]
+        buf_alloc = [get_nested(s, 'bgwriter', 'buffers_alloc', default=0) for s in pg_stats_list]
+        maxwritten = [get_nested(s, 'bgwriter', 'maxwritten_clean', default=0) for s in pg_stats_list]
+        backend_fsync = [get_nested(s, 'bgwriter', 'buffers_backend_fsync', default=0) for s in pg_stats_list]
+
+        # Compute deltas (cumulative counters)
+        def to_deltas(values):
+            if len(values) < 2:
+                return values
+            return [0] + [max(0, values[i] - values[i-1]) for i in range(1, len(values))]
+
+        buf_backend_d = to_deltas(buf_backend)
+        buf_clean_d = to_deltas(buf_clean)
+        buf_checkpoint_d = to_deltas(buf_checkpoint)
+        buf_alloc_d = to_deltas(buf_alloc)
+
+        lines.append(f"  Backend Writes/s:    {fmt_series(buf_backend_d)} (BAD if >0, means shared_buffers too small)")
+        lines.append(f"  BGWriter Cleans/s:   {fmt_series(buf_clean_d)}")
+        lines.append(f"  Checkpoint Writes/s: {fmt_series(buf_checkpoint_d)}")
+        lines.append(f"  Buffers Alloc/s:     {fmt_series(buf_alloc_d)}")
+        lines.append(f"  Cumulative: backend={buf_backend[-1] - buf_backend[0]}, bgwriter={buf_clean[-1] - buf_clean[0]}, checkpoint={buf_checkpoint[-1] - buf_checkpoint[0]}")
+        if max(maxwritten) > 0:
+            lines.append(f"  MaxWritten (bgwriter stopped): {fmt_series(to_deltas(maxwritten))} (BAD if >0)")
+        if max(backend_fsync) > 0:
+            lines.append(f"  Backend Fsync: {fmt_series(to_deltas(backend_fsync))} (VERY BAD if >0)")
+
+        # --- Checkpoint Stats ---
+        lines.append("\n[CHECKPOINTS]")
+        ckpt_timed = [get_nested(s, 'bgwriter', 'checkpoints_timed', default=0) for s in pg_stats_list]
+        ckpt_req = [get_nested(s, 'bgwriter', 'checkpoints_req', default=0) for s in pg_stats_list]
+        ckpt_write_time = [get_nested(s, 'bgwriter', 'checkpoint_write_time_ms', default=0) for s in pg_stats_list]
+        ckpt_sync_time = [get_nested(s, 'bgwriter', 'checkpoint_sync_time_ms', default=0) for s in pg_stats_list]
+
+        ckpt_req_d = to_deltas(ckpt_req)
+        lines.append(f"  Requested Checkpoints: {fmt_series(ckpt_req_d)} (BAD if >0, means max_wal_size too small)")
+        lines.append(f"  Cumulative: timed={ckpt_timed[-1]}, requested={ckpt_req[-1]}")
+        lines.append(f"  Total Write Time: {ckpt_write_time[-1] - ckpt_write_time[0]:.0f}ms, Sync Time: {ckpt_sync_time[-1] - ckpt_sync_time[0]:.0f}ms")
+
+        # --- WAL Stats (PG 14+) ---
+        wal_data = [get_nested(s, 'wal', default=None) for s in pg_stats_list]
+        if wal_data and wal_data[0]:
+            lines.append("\n[WAL]")
+            wal_bytes = [get_nested(s, 'wal', 'wal_bytes', default=0) for s in pg_stats_list]
+            wal_buffers_full = [get_nested(s, 'wal', 'wal_buffers_full', default=0) for s in pg_stats_list]
+            wal_write = [get_nested(s, 'wal', 'wal_write', default=0) for s in pg_stats_list]
+            wal_sync = [get_nested(s, 'wal', 'wal_sync', default=0) for s in pg_stats_list]
+            wal_fpi = [get_nested(s, 'wal', 'wal_fpi', default=0) for s in pg_stats_list]
+
+            wal_bytes_d = to_deltas(wal_bytes)
+            wal_mb_d = [b / (1024*1024) for b in wal_bytes_d]
+            wal_buffers_full_d = to_deltas(wal_buffers_full)
+
+            lines.append(f"  WAL MB/s:         {fmt_series(wal_mb_d, '.1f')}")
+            lines.append(f"  WAL Buffers Full: {fmt_series(wal_buffers_full_d)} (BAD if >0, increase wal_buffers)")
+            lines.append(f"  WAL Writes:       {fmt_series(to_deltas(wal_write))}")
+            lines.append(f"  WAL Syncs:        {fmt_series(to_deltas(wal_sync))}")
+            lines.append(f"  Full Page Images: {fmt_series(to_deltas(wal_fpi))}")
+            lines.append(f"  Total WAL: {(wal_bytes[-1] - wal_bytes[0]) / (1024*1024):.1f} MB")
+
+        # --- Connections ---
+        lines.append("\n[CONNECTIONS]")
+        conn_total = [get_nested(s, 'connections', 'total_connections', default=0) for s in pg_stats_list]
+        conn_pct = [get_nested(s, 'connections', 'connection_pct', default=0) for s in pg_stats_list]
+
+        lines.append(f"  Total Connections: {fmt_series(conn_total)}")
+        lines.append(f"  Connection %:      {fmt_series(conn_pct, '.1f')}")
+
+        # --- Activity ---
+        lines.append("\n[ACTIVITY]")
+        active = [get_nested(s, 'activity', 'active', default=0) for s in pg_stats_list]
+        idle = [get_nested(s, 'activity', 'idle', default=0) for s in pg_stats_list]
+        idle_txn = [get_nested(s, 'activity', 'idle_in_transaction', default=0) for s in pg_stats_list]
+        wait_lock = [get_nested(s, 'activity', 'waiting_on_lock', default=0) for s in pg_stats_list]
+        wait_io = [get_nested(s, 'activity', 'waiting_on_io', default=0) for s in pg_stats_list]
+
+        lines.append(f"  Active:              {fmt_series(active)}")
+        lines.append(f"  Idle:                {fmt_series(idle)}")
+        lines.append(f"  Idle in Transaction: {fmt_series(idle_txn)} (BAD if high)")
+        lines.append(f"  Waiting on Lock:     {fmt_series(wait_lock)} (BAD if >0)")
+        lines.append(f"  Waiting on I/O:      {fmt_series(wait_io)}")
+
+        # --- Locks ---
+        lock_data = [get_nested(s, 'locks', default={}) for s in pg_stats_list]
+        if lock_data and lock_data[0]:
+            lines.append("\n[LOCKS]")
+            lock_waiting = [get_nested(s, 'locks', 'total_waiting', default=0) for s in pg_stats_list]
+            lines.append(f"  Total Waiting: {fmt_series(lock_waiting)} (BAD if >0)")
+
+        # --- Transaction Stats ---
+        lines.append("\n[TRANSACTIONS]")
+        xact_commit = [get_nested(s, 'database', 'xact_commit', default=0) for s in pg_stats_list]
+        xact_rollback = [get_nested(s, 'database', 'xact_rollback', default=0) for s in pg_stats_list]
+        deadlocks = [get_nested(s, 'database', 'deadlocks', default=0) for s in pg_stats_list]
+        temp_files = [get_nested(s, 'database', 'temp_files', default=0) for s in pg_stats_list]
+        temp_bytes = [get_nested(s, 'database', 'temp_bytes', default=0) for s in pg_stats_list]
+
+        xact_commit_d = to_deltas(xact_commit)
+        xact_rollback_d = to_deltas(xact_rollback)
+        deadlocks_d = to_deltas(deadlocks)
+        temp_files_d = to_deltas(temp_files)
+
+        lines.append(f"  Commits/s:   {fmt_series(xact_commit_d)}")
+        lines.append(f"  Rollbacks/s: {fmt_series(xact_rollback_d)}")
+        if max(deadlocks_d) > 0:
+            lines.append(f"  Deadlocks:   {fmt_series(deadlocks_d)} (BAD!)")
+        if max(temp_files_d) > 0:
+            temp_mb = [(temp_bytes[i] - temp_bytes[i-1]) / (1024*1024) if i > 0 else 0 for i in range(len(temp_bytes))]
+            lines.append(f"  Temp Files:  {fmt_series(temp_files_d)} (BAD - increase work_mem)")
+            lines.append(f"  Temp MB:     {fmt_series(temp_mb, '.1f')}")
+
+        # --- Tuple Operations ---
+        lines.append("\n[TUPLE OPS]")
+        tup_returned = [get_nested(s, 'database', 'tup_returned', default=0) for s in pg_stats_list]
+        tup_fetched = [get_nested(s, 'database', 'tup_fetched', default=0) for s in pg_stats_list]
+        tup_inserted = [get_nested(s, 'database', 'tup_inserted', default=0) for s in pg_stats_list]
+        tup_updated = [get_nested(s, 'database', 'tup_updated', default=0) for s in pg_stats_list]
+        tup_deleted = [get_nested(s, 'database', 'tup_deleted', default=0) for s in pg_stats_list]
+
+        lines.append(f"  Returned/s: {fmt_series(to_deltas(tup_returned))}")
+        lines.append(f"  Fetched/s:  {fmt_series(to_deltas(tup_fetched))}")
+        lines.append(f"  Inserted/s: {fmt_series(to_deltas(tup_inserted))}")
+        lines.append(f"  Updated/s:  {fmt_series(to_deltas(tup_updated))}")
+        lines.append(f"  Deleted/s:  {fmt_series(to_deltas(tup_deleted))}")
+
+        # --- Block I/O Timing ---
+        blk_read_time = [get_nested(s, 'database', 'blk_read_time_ms', default=0) for s in pg_stats_list]
+        blk_write_time = [get_nested(s, 'database', 'blk_write_time_ms', default=0) for s in pg_stats_list]
+        if max(blk_read_time) > 0 or max(blk_write_time) > 0:
+            lines.append("\n[BLOCK I/O TIMING]")
+            lines.append(f"  Read Time ms:  {fmt_series(to_deltas(blk_read_time), '.1f')}")
+            lines.append(f"  Write Time ms: {fmt_series(to_deltas(blk_write_time), '.1f')}")
+
+    # =========================================================================
+    # SECTION 3: ANOMALY DETECTION
+    # =========================================================================
+    lines.append("\n" + "=" * 60)
+    lines.append("ANOMALY DETECTION")
+    lines.append("=" * 60)
     anomalies = []
 
     # Detect IO spikes
-    if iostat:
-        utils = [s.get('util', 0) for s in iostat]
-        avg_util = sum(utils) / len(utils)
-        for i, u in enumerate(utils):
-            if u > avg_util * 1.5 and u > 80:
-                anomalies.append(f"IO spike at T+{i*5}s: {u:.0f}% (avg: {avg_util:.0f}%)")
+    if iostat_list:
+        io_util = [get_io_val(s, 'util_pct') or get_io_val(s, 'util') for s in iostat_list]
+        io_await = [get_io_val(s, 'await_ms') or get_io_val(s, 'await') for s in iostat_list]
+        avg_util = sum(io_util) / len(io_util) if io_util else 0
+        avg_await = sum(io_await) / len(io_await) if io_await else 0
 
-        awaits = [s.get('await', 0) for s in iostat]
-        avg_await = sum(awaits) / len(awaits)
-        for i, a in enumerate(awaits):
-            if a > avg_await * 2 and a > 10:
-                anomalies.append(f"IO latency spike at T+{i*5}s: {a:.1f}ms (avg: {avg_await:.1f}ms)")
+        for i, u in enumerate(io_util):
+            if u > 95:
+                anomalies.append(f"CRITICAL: Disk saturated at T+{i}s: {u:.0f}% util")
+            elif u > avg_util * 1.5 and u > 80:
+                anomalies.append(f"IO spike at T+{i}s: {u:.0f}% (avg: {avg_util:.0f}%)")
 
-    # Detect CPU wait spikes (indicates IO bottleneck)
-    if vmstat:
-        waits = [s.get('cpu_wait', 0) for s in vmstat]
-        for i, w in enumerate(waits):
-            if w > 20:
-                anomalies.append(f"High CPU wait at T+{i*5}s: {w:.0f}%")
+        for i, a in enumerate(io_await):
+            if a > 50:
+                anomalies.append(f"CRITICAL: High IO latency at T+{i}s: {a:.1f}ms")
+            elif a > avg_await * 2 and a > 10:
+                anomalies.append(f"IO latency spike at T+{i}s: {a:.1f}ms (avg: {avg_await:.1f}ms)")
 
-    # Detect cache hit drops
-    if pg_stats:
-        hits = [s.get('cache_hit_ratio', 100) for s in pg_stats]
-        for i, h in enumerate(hits):
-            if h < 95:
-                anomalies.append(f"Low cache hit at T+{i*5}s: {h:.1f}%")
+    # Detect CPU issues
+    if vmstat_list:
+        cpu_wait = [get_nested(s, 'cpu', 'wait_pct', default=s.get('cpu_wait', 0)) for s in vmstat_list]
+        for i, w in enumerate(cpu_wait):
+            if w > 30:
+                anomalies.append(f"CRITICAL: CPU I/O wait at T+{i}s: {w:.0f}%")
+            elif w > 15:
+                anomalies.append(f"High CPU wait at T+{i}s: {w:.0f}%")
+
+    # Detect PG issues
+    if pg_stats_list:
+        cache_hit = [get_nested(s, 'database', 'cache_hit_ratio', default=100) for s in pg_stats_list]
+        for i, h in enumerate(cache_hit):
+            if h < 90:
+                anomalies.append(f"CRITICAL: Low cache hit at T+{i}s: {h:.1f}%")
+            elif h < 95:
+                anomalies.append(f"Cache hit drop at T+{i}s: {h:.1f}%")
+
+        # Backend writes (very bad)
+        buf_backend = [get_nested(s, 'bgwriter', 'buffers_backend', default=0) for s in pg_stats_list]
+        buf_backend_d = to_deltas(buf_backend)
+        for i, b in enumerate(buf_backend_d):
+            if b > 100:
+                anomalies.append(f"CRITICAL: Backend buffer writes at T+{i}s: {b} (increase shared_buffers!)")
+            elif b > 0:
+                anomalies.append(f"Backend writes at T+{i}s: {b}")
+
+        # Requested checkpoints (bad)
+        ckpt_req = [get_nested(s, 'bgwriter', 'checkpoints_req', default=0) for s in pg_stats_list]
+        ckpt_req_d = to_deltas(ckpt_req)
+        for i, c in enumerate(ckpt_req_d):
+            if c > 0:
+                anomalies.append(f"Forced checkpoint at T+{i}s (increase max_wal_size!)")
 
     if anomalies:
-        for anomaly in anomalies[:10]:  # Limit to 10 anomalies
+        for anomaly in anomalies[:20]:  # Show more anomalies
             lines.append(f"  ⚠ {anomaly}")
     else:
-        lines.append("  No significant anomalies detected")
+        lines.append("  ✓ No significant anomalies detected")
 
     return "\n".join(lines) if lines else "No telemetry data collected"
 
@@ -1499,6 +2015,93 @@ def apply_round1_config(
     return {'success': True, 'applied_changes': applied_changes}
 
 
+def verify_applied_settings(conn, changed_params: List[str], ui: 'DiagnoseUI') -> Dict[str, Any]:
+    """
+    Query pg_settings to verify that settings were applied correctly.
+
+    Args:
+        conn: Database connection
+        changed_params: List of parameter names that were changed
+        ui: UI instance
+
+    Returns:
+        Dict with verified settings and any mismatches
+    """
+    if not changed_params:
+        return {'verified': [], 'mismatches': []}
+
+    results = {'verified': [], 'mismatches': []}
+
+    try:
+        # Query all changed params at once
+        param_list = ', '.join(f"'{p.lower()}'" for p in changed_params)
+        query = f"""
+            SELECT name, setting, unit, context, pending_restart
+            FROM pg_settings
+            WHERE name IN ({param_list})
+            ORDER BY name
+        """
+
+        with conn.cursor() as cur:
+            cur.execute(query)
+            rows = cur.fetchall()
+
+        if ui.console and RICH_AVAILABLE:
+            from rich.table import Table
+            from rich import box
+
+            table = Table(
+                title="[bold green]✓ Applied Settings Verification[/]",
+                box=box.ROUNDED,
+                show_header=True,
+                header_style="bold cyan",
+            )
+            table.add_column("Parameter", style="cyan", width=30)
+            table.add_column("Value", width=20)
+            table.add_column("Unit", width=8)
+            table.add_column("Status", width=15)
+
+            for row in rows:
+                name, setting, unit, context, pending = row
+                unit_str = unit or ''
+
+                # Check if pending restart
+                if pending:
+                    status = "[yellow]Pending Restart[/]"
+                else:
+                    status = "[green]Active[/]"
+
+                # Format value with unit
+                if unit_str:
+                    value_str = f"{setting} {unit_str}"
+                else:
+                    value_str = setting
+
+                table.add_row(name, value_str, unit_str, status)
+                results['verified'].append({
+                    'name': name,
+                    'value': setting,
+                    'unit': unit,
+                    'pending_restart': pending,
+                })
+
+            ui.console.print()
+            ui.console.print(table)
+
+        else:
+            ui.print("\n=== Applied Settings Verification ===")
+            for row in rows:
+                name, setting, unit, context, pending = row
+                unit_str = unit or ''
+                status = "(Pending Restart)" if pending else "(Active)"
+                ui.print(f"  {name}: {setting} {unit_str} {status}")
+
+    except Exception as e:
+        ui.print(f"[yellow]Warning: Could not verify settings: {e}[/]" if ui.console else f"Warning: Could not verify settings: {e}")
+
+    return results
+
+
 def restart_postgresql_with_retry(ssh_config: Dict, ui: 'DiagnoseUI', max_retries: int = 5, timeout_sec: int = 5) -> bool:
     """
     Restart PostgreSQL and wait for it to be ready.
@@ -1627,6 +2230,179 @@ def reconnect_with_retry(
             else:
                 ui.spinner_stop("Reconnection failed")
                 raise Exception(f"Could not reconnect after {max_retries} attempts: {e}")
+
+
+def capture_config_snapshot(conn, applied_changes: List[Dict]) -> Dict[str, str]:
+    """
+    Capture current PostgreSQL config values for params that were modified.
+
+    Returns dict of {param_name: current_value} for rollback purposes.
+    """
+    snapshot = {}
+
+    # Extract param names from applied changes
+    params_to_capture = set()
+    for change in applied_changes:
+        for cmd in change.get('pg_configs', []):
+            # Parse ALTER SYSTEM SET param = value
+            if 'ALTER SYSTEM SET' in cmd.upper():
+                # Extract param name (e.g., "shared_buffers" from "ALTER SYSTEM SET shared_buffers = '8GB'")
+                parts = cmd.split('=')[0].upper().replace('ALTER SYSTEM SET', '').strip()
+                param_name = parts.lower()
+                params_to_capture.add(param_name)
+
+    if not params_to_capture:
+        return snapshot
+
+    # Query current values from pg_settings
+    try:
+        with conn.cursor() as cur:
+            placeholders = ','.join(['%s'] * len(params_to_capture))
+            cur.execute(f"""
+                SELECT name, setting
+                FROM pg_settings
+                WHERE name IN ({placeholders})
+            """, tuple(params_to_capture))
+
+            for row in cur.fetchall():
+                snapshot[row[0]] = row[1]
+    except Exception:
+        pass  # Non-critical, return partial snapshot
+
+    return snapshot
+
+
+def rollback_to_snapshot(
+    conn,
+    target_snapshot: Dict[str, str],
+    current_changes: List[Dict],
+    ui: 'DiagnoseUI',
+    ssh_config: Optional[Dict] = None,
+) -> Dict[str, Any]:
+    """
+    Rollback PostgreSQL config to a previous snapshot state.
+
+    Strategy:
+    1. For each param in current_changes not in target_snapshot: ALTER SYSTEM RESET
+    2. For each param in target_snapshot: ALTER SYSTEM SET to snapshot value
+
+    Returns dict with:
+      - success: True if rollback completed
+      - reset_params: List of params that were reset
+      - set_params: List of params that were set to snapshot values
+      - restart_required: True if any restart-requiring param was changed
+    """
+    reset_params = []
+    set_params = []
+    restart_required = False
+
+    # Params requiring restart if changed
+    restart_params = {'shared_buffers', 'max_connections', 'wal_buffers',
+                      'max_worker_processes', 'max_parallel_workers'}
+
+    # Get params from current changes that might need rollback
+    current_params = set()
+    for change in current_changes:
+        for cmd in change.get('pg_configs', []):
+            if 'ALTER SYSTEM SET' in cmd.upper():
+                parts = cmd.split('=')[0].upper().replace('ALTER SYSTEM SET', '').strip()
+                param_name = parts.lower()
+                current_params.add(param_name)
+
+    ui.spinner_start("Rolling back configuration...")
+
+    conn.rollback()
+    old_autocommit = conn.autocommit
+    conn.autocommit = True
+
+    try:
+        with conn.cursor() as cur:
+            # Reset params not in target snapshot
+            for param in current_params:
+                if param not in target_snapshot:
+                    try:
+                        cur.execute(f"ALTER SYSTEM RESET {param}")
+                        reset_params.append(param)
+                        if param in restart_params:
+                            restart_required = True
+                    except Exception as e:
+                        ui.print(f"[yellow]Warning: Could not reset {param}: {e}[/]" if ui.console else f"Warning: Could not reset {param}")
+
+            # Set params to snapshot values
+            for param, value in target_snapshot.items():
+                try:
+                    # Handle special cases for value formatting
+                    if value.isdigit():
+                        cur.execute(f"ALTER SYSTEM SET {param} = {value}")
+                    else:
+                        cur.execute(f"ALTER SYSTEM SET {param} = '{value}'")
+                    set_params.append(param)
+                    if param in restart_params:
+                        restart_required = True
+                except Exception as e:
+                    ui.print(f"[yellow]Warning: Could not set {param}={value}: {e}[/]" if ui.console else f"Warning: Could not set {param}={value}")
+
+            # Reload config
+            cur.execute("SELECT pg_reload_conf()")
+
+        ui.spinner_stop("Configuration rolled back")
+
+    finally:
+        conn.autocommit = old_autocommit
+
+    return {
+        'success': True,
+        'reset_params': reset_params,
+        'set_params': set_params,
+        'restart_required': restart_required,
+    }
+
+
+def display_round_summary(
+    ui: 'DiagnoseUI',
+    round_num: int,
+    current_tps: float,
+    tuning_history: Dict[str, Any],
+    target_tps: float,
+    target_hit: bool,
+):
+    """
+    Display summary at end of each round with TPS milestone chart.
+    """
+    ui.print()
+    if RICH_AVAILABLE and ui.console:
+        ui.console.rule(f"[bold cyan]Round {round_num} Summary[/]")
+    else:
+        ui.print("=" * 50)
+        ui.print(f"Round {round_num} Summary")
+        ui.print("=" * 50)
+
+    # TPS comparison
+    baseline_tps = tuning_history['baseline_tps']
+    best_tps = tuning_history['best_tps']
+    improvement_from_baseline = ((current_tps - baseline_tps) / baseline_tps * 100) if baseline_tps > 0 else 0
+
+    ui.print()
+    if ui.console:
+        if target_hit:
+            ui.console.print(f"[bold green]✓ Target Achieved![/] Current: {current_tps:,.0f} TPS | Target: {target_tps:,.0f} TPS")
+        else:
+            ui.console.print(f"[yellow]○ Target Not Hit[/] Current: {current_tps:,.0f} TPS | Target: {target_tps:,.0f} TPS")
+        ui.console.print(f"  Baseline: {baseline_tps:,.0f} TPS | Best: {best_tps:,.0f} TPS | Improvement: {improvement_from_baseline:+.1f}%")
+    else:
+        status = "✓ Target Achieved!" if target_hit else "○ Target Not Hit"
+        ui.print(f"{status} Current: {current_tps:.0f} TPS | Target: {target_tps:.0f} TPS")
+        ui.print(f"  Baseline: {baseline_tps:.0f} TPS | Best: {best_tps:.0f} TPS | Improvement: {improvement_from_baseline:+.1f}%")
+
+    # Display TPS milestone chart
+    if RICH_AVAILABLE and tuning_history.get('tps_history'):
+        timeline = ProgressTimeline(ui.console)
+        timeline.display(
+            tuning_history['tps_history'],
+            target_tps,
+            round_num,
+            target_achieved=target_hit
+        )
 
 
 def display_final_summary(
@@ -1884,6 +2660,50 @@ def run_export_mode(session_data: Dict, args, ui: 'DiagnoseUI'):
 def main():
     """Main entry point."""
     args = parse_args()
+
+    # ==================== Load Config File ====================
+    config = None
+    config_source = None
+    try:
+        config = Config.load(args.config)
+        if config._config_file:
+            config_source = str(config._config_file)
+    except FileNotFoundError as e:
+        # Only error if explicit config was requested
+        if args.config:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+    except Exception as e:
+        print(f"Warning: Failed to load config: {e}", file=sys.stderr)
+
+    # Apply config values as defaults for missing CLI arguments
+    if config:
+        # Database settings
+        if not args.host and config.database.host:
+            args.host = config.database.host
+        if args.port == 5432 and config.database.port != 5432:
+            args.port = config.database.port
+        if args.user == "postgres" and config.database.user != "postgres":
+            args.user = config.database.user
+        if not args.password and config.database.password:
+            args.password = config.database.password
+        if not args.database and config.database.name != "postgres":
+            args.database = config.database.name
+
+        # SSH settings
+        if not args.ssh_host and config.ssh.host:
+            args.ssh_host = f"{config.ssh.user}@{config.ssh.host}"
+        if args.ssh_port == 22 and config.ssh.port != 22:
+            args.ssh_port = config.ssh.port
+
+        # Tuning settings
+        if args.max_rounds == 5 and config.tuning.max_rounds != 5:
+            args.max_rounds = config.tuning.max_rounds
+
+        # AI API key - set environment variable if in config
+        if config.ai.api_key and not os.environ.get('GEMINI_API_KEY'):
+            os.environ['GEMINI_API_KEY'] = config.ai.api_key
+
     password = args.password or os.environ.get('PGPASSWORD')
 
     # ==================== Test Mode Setup ====================
@@ -1898,6 +2718,11 @@ def main():
 
     # Initialize UI
     ui = DiagnoseUI()
+
+    # Show config file status
+    if config_source:
+        auto_detected = " (auto-detected)" if not args.config else ""
+        ui.print(f"[dim]Config: {config_source}{auto_detected}[/]" if RICH_AVAILABLE else f"Config: {config_source}{auto_detected}")
 
     # Connect test handler to UI if in test mode
     if test_handler:
@@ -1914,6 +2739,8 @@ def main():
     # ==================== Validate Host for Connection Modes ====================
     if not args.host:
         ui.print_error("Host (-H) is required")
+        ui.print("Provide via CLI: pg_diagnose -H hostname")
+        ui.print("Or set [database].host in config.toml")
         sys.exit(1)
 
     # Initialize session state for slash commands
@@ -2298,7 +3125,7 @@ def main():
 
             # Confirm resume
             ui.print()
-            continue_choice = ui.prompt("Continue? [Y/n]: ").strip().lower()
+            continue_choice = ui.prompt("Continue? ", default="y").strip().lower()
             if continue_choice in ['n', 'no']:
                 ui.print("Session remains paused.")
                 return
@@ -2310,9 +3137,10 @@ def main():
             context_packet = run_discovery(conn, ssh_config)
             ui.spinner_stop("Analysis complete")
 
-        # Step 4: First Sight Analysis (skip if resuming with baseline)
+        # Step 4: First Sight Analysis (skip only if resuming to tuning loop)
+        # Note: skip_to_baseline still needs first_sight for get_round1_config
         first_sight = None
-        if not skip_to_baseline and not skip_to_tuning_loop:
+        if not skip_to_tuning_loop:
             ui.print()
             ui.spinner_start("Consulting AI for recommendations...")
             first_sight = agent.first_sight_analysis(context_packet)
@@ -2397,13 +3225,13 @@ def main():
                 })
                 ui.spinner_stop("Plan ready")
 
-            # ===== SKIP BASELINE IF RESUMING WITH ROUNDS =====
-            if skip_to_tuning_loop:
-                # Use saved values from resume
+            # ===== SKIP BASELINE IF RESUMING WITH SAVED BASELINE =====
+            if skip_to_tuning_loop or (skip_to_baseline and resume_true_baseline_tps and resume_true_baseline_tps > 0):
+                # Use saved values from resume - already have baseline data
                 true_baseline_tps = resume_true_baseline_tps
                 target_tps = resume_target_tps
                 ui.print()
-                ui.print(f"[dim]Baseline TPS: {true_baseline_tps:,.0f} | Target: {target_tps:,.0f}[/]" if RICH_AVAILABLE else f"Baseline: {true_baseline_tps:.0f} | Target: {target_tps:.0f}")
+                ui.print(f"[dim]Using saved baseline: {true_baseline_tps:,.0f} TPS | Target: {target_tps:,.0f} TPS[/]" if RICH_AVAILABLE else f"Using saved baseline: {true_baseline_tps:.0f} TPS | Target: {target_tps:.0f} TPS")
             else:
                 # Step 8: Run BASELINE benchmark (before any config changes)
                 # Set phase to BASELINE
@@ -2494,6 +3322,15 @@ def main():
                     elif error_choice in ['/skip', 'skip', 's']:
                         ui.print("[yellow]Continuing with 0 TPS baseline (results may be unreliable)[/]" if ui.console else "Continuing with 0 TPS baseline")
                         true_baseline_tps = 1  # Avoid division by zero
+                    elif error_choice in ['/new', 'new', 'n']:
+                        ui.print("Starting new session...")
+                        if ws_session:
+                            ws_session.fail("Baseline benchmark failed - user started new session")
+                        # Reset and restart the main loop
+                        ws_session = None
+                        chosen_strategy_dict = None
+                        context_packet = None
+                        continue  # Go back to strategy selection
                     else:
                         ui.print("Exiting due to benchmark failure.")
                         if ws_session:
@@ -2543,7 +3380,7 @@ def main():
 
                 target_tps = None
                 while True:
-                    target_cmd = ui.prompt("> ").strip()
+                    target_cmd = ui.prompt("> ", default="/accept").strip()
 
                     if target_cmd.lower() in ['/accept', '/a', 'y', 'yes', '']:
                         target_tps = suggested_target
@@ -2663,7 +3500,7 @@ def main():
                         ui.print(f"Warning: Baseline ({true_baseline_tps:.0f}) already meets target ({target_tps:.0f})!")
                         ui.print("Continue tuning to prevent regression?")
 
-                    continue_choice = ui.prompt("Continue tuning? [Y/n]: ").strip().lower()
+                    continue_choice = ui.prompt("Continue tuning? ", default="y").strip().lower()
                     if continue_choice in ['n', 'no']:
                         ui.print("[green]Session complete. Baseline is optimal.[/]" if ui.console else "Session complete.")
 
@@ -2677,8 +3514,8 @@ def main():
                         }
                         display_final_summary(ui, tuning_history, target_tps, True)
 
-                        continue_strategy = ui.prompt("Try a different strategy? [y/N]: ").strip().lower()
-                        if continue_strategy != 'y':
+                        continue_strategy = ui.prompt("Try a different strategy? ", default="n").strip().lower()
+                        if continue_strategy not in ['y', 'yes']:
                             break
                         ws_session = None  # Reset for new session on next strategy
                         skip_to_baseline = False
@@ -2779,62 +3616,14 @@ def main():
                 )
                 ui.show_status_line()
 
-                # Step 12: Display benchmark results
-                ui.display_benchmark_result(benchmark_result, chosen_strategy_dict.get('target_kpis', {}))
-
-                # Step 13: Get DBA feedback on Round 1 results
-                ui.print()
-                if ui.console:
-                    ui.console.print("[cyan]DBA Feedback on Round 1:[/]")
-                    ui.console.print("[dim]Provide feedback or instructions for AI to consider in next tuning round.[/]")
-                    ui.console.print("[dim]Examples: 'enable synchronous_commit', 'focus on WAL tuning', 'skip memory changes'[/]")
-                else:
-                    ui.print("DBA Feedback on Round 1:")
-                    ui.print("(e.g., 'enable synchronous_commit', 'focus on WAL tuning')")
-
-                dba_feedback = ui.prompt("Custom instructions (Enter to skip): ").strip()
-
-                human_feedback = None
-                if dba_feedback:
-                    human_feedback = {
-                        'message': dba_feedback,
-                        'round': 1,  # Feedback on Round 1
-                    }
-                    ui.print(f"[green]Feedback noted[/]" if ui.console else "Feedback noted")
-
-                # Step 14: Send results to AI for analysis
-                ui.print()
-                ui.spinner_start("AI analyzing results...")
-
-                telemetry_summary = format_telemetry_summary(telemetry)
-                analysis = agent.analyze_results(
-                    strategy=strategy,
-                    result=benchmark_result,
-                    telemetry_summary=telemetry_summary,
-                    current_config=db_config,
-                    target_kpis=chosen_strategy_dict.get('target_kpis', {}),
-                    human_feedback=human_feedback,
-                )
-                ui.spinner_stop("Analysis complete")
-
-                # Step 15: Display AI analysis
-                ui.display_ai_analysis(analysis)
-
-                # ===================== TUNING ROUNDS =====================
-                # Track tuning history
+                # Step 12: Display benchmark results + Round Summary (merged - no LLM call yet)
                 round1_tps = benchmark_result.metrics.tps if benchmark_result.metrics else 0
                 round1_improvement = ((round1_tps - true_baseline_tps) / true_baseline_tps * 100) if true_baseline_tps > 0 else 0
 
-                # Show Round 1 improvement from baseline
-                ui.print()
-                if ui.console:
-                    if round1_improvement > 0:
-                        ui.console.print(f"[bold green]Round 1 Result: {round1_tps:.0f} TPS (+{round1_improvement:.1f}% from baseline)[/]")
-                    else:
-                        ui.console.print(f"[yellow]Round 1 Result: {round1_tps:.0f} TPS ({round1_improvement:.1f}% from baseline)[/]")
-                else:
-                    ui.print(f"Round 1 Result: {round1_tps:.0f} TPS ({round1_improvement:+.1f}% from baseline)")
+                # Combined benchmark result + round summary display
+                ui.display_benchmark_result(benchmark_result, chosen_strategy_dict.get('target_kpis', {}))
 
+                # Initialize tuning history BEFORE checking target
                 tuning_history = {
                     'iterations_completed': 1,  # Round 1 is complete
                     'baseline_tps': true_baseline_tps,  # TRUE baseline (before any config changes)
@@ -2842,7 +3631,6 @@ def main():
                     'applied_changes': initial_applied_changes.copy(),  # Include round 0 changes
                     'best_tps': round1_tps,  # Best TPS after tuning
                     'best_config_snapshot': {},
-                    'no_improvement_rounds': 0,
                 }
 
                 # Sync session state for slash commands
@@ -2857,103 +3645,205 @@ def main():
                 # Set round_num for tuning loop
                 round_num = 2  # Next round is Round 2 (Round 1 was the initial benchmark)
 
-                # Check if target already hit after Round 1
-                if target_tps > 0 and round1_tps >= target_tps:
+                # Check if target hit after Round 1
+                round1_target_hit = target_tps > 0 and round1_tps >= target_tps
+                if round1_target_hit:
+                    target_ever_achieved = True
+                    last_successful_snapshot = capture_config_snapshot(conn, tuning_history['applied_changes'])
+                    last_successful_round = 1
+                    last_successful_changes = tuning_history['applied_changes'].copy()
                     ui.print()
-                    ui.print(f"[bold green]🎉 Target TPS {target_tps:.0f} achieved in Round 1! (current: {round1_tps:.0f}, +{round1_improvement:.1f}% from baseline)[/]" if ui.console else f"Target TPS {target_tps:.0f} achieved in Round 1! (+{round1_improvement:.1f}%)")
-                    ui.print(f"[green]Skipping further tuning rounds - target already met.[/]" if ui.console else "Skipping further tuning - target met.")
+                    ui.print(f"[bold green]🎉 Target TPS {target_tps:.0f} achieved in Round 1![/]" if ui.console else f"Target TPS {target_tps:.0f} achieved!")
 
-                    # Jump to final summary
-                    target_hit_final = True
+                # ===== ROUND 1 SUMMARY (displayed immediately, no LLM call) =====
+                display_round_summary(ui, 1, round1_tps, tuning_history, target_tps, round1_target_hit)
+
+                # ===== ROUND 1 END PROMPT: Continue or Stop (LLM call deferred to /go) =====
+                ui.print()
+                if ui.console:
+                    ui.console.print("[bold cyan]Round 1 Complete - What's Next?[/]")
+                    ui.console.print()
+                    ui.console.print("  [green]/go[/]      Get AI analysis & continue to Round 2")
+                    ui.console.print("  [yellow]/done[/]    End session (keep current config)")
+                    ui.console.print("  [dim]/custom[/]   Add instructions for AI")
+                    ui.console.print("  [dim]/pause[/]    Pause and return later")
+                else:
+                    ui.print("Round 1 Complete - What's Next?")
+                    ui.print("  /go    - Get AI analysis & continue")
+                    ui.print("  /done  - End session")
+                    ui.print("  /custom - Add AI instructions")
+                    ui.print("  /pause - Pause session")
+
+                r1_human_feedback = None
+                r1_action = None
+                while True:
+                    r1_cmd = ui.prompt("> ", default="/go").strip().lower()
+
+                    if r1_cmd in ['/go', '/g', '']:
+                        r1_action = 'continue'
+                        break
+
+                    if r1_cmd in ['/done', '/d']:
+                        ui.print("Ending session with Round 1 results...")
+                        r1_action = 'done'
+                        break
+
+                    if r1_cmd in ['/stop', '/pause']:
+                        ui.print()
+                        ui.print("[yellow]Pausing session...[/]" if ui.console else "Pausing session...")
+                        if ws_session:
+                            ws_session.pause()
+                        ui.print(f"Session paused. Returning to session list...")
+                        raise StopIteration("SESSION")
+
+                    if r1_cmd in ['/quit', '/q']:
+                        ui.print()
+                        ui.print("[yellow]Pausing session...[/]" if ui.console else "Pausing session...")
+                        if ws_session:
+                            ws_session.pause()
+                        ui.print(f"Session paused. Returning to session list...")
+                        raise StopIteration("SESSION")
+
+                    if r1_cmd.startswith('/custom'):
+                        inline_text = r1_cmd[7:].strip()
+                        if inline_text:
+                            r1_human_feedback = {'message': inline_text, 'round': 1}
+                            ui.print(f"[green]Custom instructions noted for Round 2[/]" if ui.console else f"Instructions noted")
+                            r1_action = 'continue'
+                            break
+                        if ui.console:
+                            ui.console.print("[dim]Enter your custom instructions:[/]")
+                        else:
+                            print("Enter your custom instructions:")
+                        custom_text = ui.prompt("Instructions: ", allow_commands=False).strip()
+                        if custom_text:
+                            r1_human_feedback = {'message': custom_text, 'round': 1}
+                            ui.print(f"[green]Custom instructions noted for Round 2[/]" if ui.console else f"Instructions noted")
+                        r1_action = 'continue'
+                        break
+
+                    ui.print(f"[yellow]Unknown command: {r1_cmd}. Type /go to continue or /done to end.[/]" if ui.console else f"Unknown command: {r1_cmd}")
+
+                # Handle user choice
+                if r1_action == 'done':
+                    # End session with current results
+                    target_hit_final = round1_target_hit
                     display_final_summary(ui, tuning_history, target_tps, target_hit_final)
 
-                    # ===== ARCHIVE WORKSPACE SESSION (R1 success) =====
-                    conclusion = f"Target achieved in Round 1! Best TPS: {round1_tps:.0f}"
-                    ws_session.archive(conclusion)
-                    ui.show_status_line()
+                    if ws_session:
+                        if round1_target_hit:
+                            conclusion = f"Target achieved in Round 1! Best TPS: {round1_tps:.0f}"
+                            ws_session.archive(conclusion)
+                        else:
+                            conclusion = f"Session ended by user after Round 1. Best TPS: {round1_tps:.0f}"
+                            ws_session.archive(conclusion)
+                        ui.show_status_line()
 
-                    if RICH_AVAILABLE and tuning_history['tps_history']:
-                        timeline = ProgressTimeline(ui.console)
-                        timeline.display(tuning_history['tps_history'], target_tps,
-                                       tuning_history['iterations_completed'], target_achieved=True)
+                    # Session save
+                    if args.save_session:
+                        from .session import SessionManager, session_from_state
+                        manager = SessionManager()
+                        session_state.current_round = tuning_history['iterations_completed']
+                        session_state.tps_history = tuning_history['tps_history']
+                        session_state.applied_changes = tuning_history['applied_changes']
+                        session_state.best_tps = tuning_history['best_tps']
+                        session_data = session_from_state(session_state)
+                        session_data.status = 'completed'
+                        manager.save(session_data, args.save_session)
+                        ui.print(f"\n[green]Session saved as '{args.save_session}'[/]" if ui.console else f"\nSession saved as '{args.save_session}'")
 
-                # Session save and continue prompt
-                if args.save_session:
-                    from .session import SessionManager, session_from_state
-                    manager = SessionManager()
-                    session_state.current_round = tuning_history['iterations_completed']
-                    session_state.tps_history = tuning_history['tps_history']
-                    session_state.applied_changes = tuning_history['applied_changes']
-                    session_state.best_tps = tuning_history['best_tps']
-                    session_data = session_from_state(session_state)
-                    session_data.status = 'completed'
-                    manager.save(session_data, args.save_session)
-                    ui.print(f"\n[green]Session saved as '{args.save_session}'[/]" if ui.console else f"\nSession saved as '{args.save_session}'")
-
-                ui.print()
-                ui.show_context_menu('session_end')
-                continue_choice = ui.prompt("Continue with a different strategy? [y/N]: ").strip().lower()
-
-                # Handle slash commands
-                if continue_choice in ['/quit', '/q', 'n', 'no', '']:
+                    # Session end options
                     ui.print()
                     if ui.console:
-                        ui.console.print("[bold green]Thank you for using PostgreSQL Diagnostic Tool![/]")
+                        ui.console.print("[bold cyan]Session Complete[/]")
+                        ui.console.print()
+                        ui.console.print("  [green]/new[/]      Start new session with different strategy")
+                        ui.console.print("  [yellow]/back[/]     Return to session list")
+                        ui.console.print("  [dim]/quit[/]     Exit tool")
                     else:
-                        ui.print("Thank you for using PostgreSQL Diagnostic Tool!")
-                    break
-                if continue_choice in ['/export', '/e']:
-                    if ws_session:
-                        ui.print(f"Session data saved in workspace: {workspace.name}")
-                    continue
-                if continue_choice not in ['y', 'yes', '/new', '/n']:
-                    break
+                        ui.print("Session Complete")
+                        ui.print("  /new  - New session")
+                        ui.print("  /back - Session list")
+                        ui.print("  /quit - Exit")
 
-                # ===== GET NEW STRATEGIES FROM AI (after R1 success) =====
-                previous_session_summary = {
-                    'baseline_tps': tuning_history['baseline_tps'],
-                    'best_tps': tuning_history['best_tps'],
-                    'improvement_pct': round1_improvement,
-                    'rounds_completed': 1,
-                    'target_tps': target_tps,
-                    'target_achieved': True,
-                    'applied_changes': tuning_history['applied_changes'],
-                }
+                    end_cmd = ui.prompt("> ", default="/back").strip().lower()
 
-                excluded_strategy_info = {
-                    'id': selected_option.id,
-                    'name': selected_option.name,
-                    'goal': selected_option.goal,
-                    'hypothesis': selected_option.hypothesis,
-                    'target_kpis': selected_option.target_kpis,
-                }
+                    if end_cmd in ['/new', '/n', 'y', 'yes']:
+                        # Get new strategies from AI
+                        previous_session_summary = {
+                            'baseline_tps': tuning_history['baseline_tps'],
+                            'best_tps': tuning_history['best_tps'],
+                            'improvement_pct': round1_improvement,
+                            'rounds_completed': 1,
+                            'target_tps': target_tps,
+                            'target_achieved': round1_target_hit,
+                            'applied_changes': tuning_history['applied_changes'],
+                        }
 
+                        excluded_strategy_info = {
+                            'id': selected_option.id,
+                            'name': selected_option.name,
+                            'goal': selected_option.goal,
+                            'hypothesis': selected_option.hypothesis,
+                            'target_kpis': selected_option.target_kpis,
+                        }
+
+                        ui.print()
+                        ui.spinner_start("AI generating new strategies...")
+
+                        try:
+                            first_sight = agent.get_next_strategies(
+                                context=context_packet,
+                                previous_session=previous_session_summary,
+                                excluded_strategy=excluded_strategy_info,
+                            )
+                            ui.spinner_stop("New strategies ready")
+                            ui.display_first_sight(first_sight)
+                        except Exception as e:
+                            ui.spinner_stop("Failed to get new strategies")
+                            ui.print_error(f"Error getting new strategies: {e}")
+                            ui.print("Falling back to original strategy options...")
+                            ui.display_first_sight(first_sight)
+
+                        ws_session = None  # Reset for new session
+                        continue  # Go to strategy selection
+
+                    elif end_cmd in ['/back', '/b']:
+                        raise StopIteration("SESSION")
+                    else:
+                        # Default: quit
+                        ui.print()
+                        if ui.console:
+                            ui.console.print("[bold green]Thank you for using PostgreSQL Diagnostic Tool![/]")
+                        else:
+                            ui.print("Thank you for using PostgreSQL Diagnostic Tool!")
+                        break
+
+                # User chose to continue - NOW call LLM for analysis (deferred from earlier)
                 ui.print()
-                ui.spinner_start("AI analyzing successful session and generating new strategies...")
+                ui.spinner_start("AI analyzing results for Round 2...")
 
-                try:
-                    first_sight = agent.get_next_strategies(
-                        context=context_packet,
-                        previous_session=previous_session_summary,
-                        excluded_strategy=excluded_strategy_info,
-                    )
-                    ui.spinner_stop("New strategies ready")
-                    ui.display_first_sight(first_sight)
-                except Exception as e:
-                    ui.spinner_stop("Failed to get new strategies")
-                    ui.print_error(f"Error getting new strategies: {e}")
-                    ui.print("Falling back to original strategy options...")
-                    ui.display_first_sight(first_sight)
+                telemetry_summary = format_telemetry_summary(telemetry)
+                analysis = agent.analyze_results(
+                    strategy=strategy,
+                    result=benchmark_result,
+                    telemetry_summary=telemetry_summary,
+                    current_config=db_config,
+                    target_kpis=chosen_strategy_dict.get('target_kpis', {}),
+                    human_feedback=r1_human_feedback,
+                )
+                ui.spinner_stop("Analysis ready")
 
-                ws_session = None  # Reset for new session on next strategy
-                continue  # Go to strategy selection with new strategies
+                # Display AI analysis
+                ui.display_ai_analysis(analysis)
 
             # ===== TUNING LOOP (accessible from both resume and normal paths) =====
             # Initialize tuning loop tracking variables
-            max_no_target_hit = 3  # Break after 3 rounds not hitting target
-            consecutive_hits_required = 2  # Need 2 consecutive hits to confirm success
-            no_target_hit_count = 0
-            consecutive_target_hits = 0
+            # Note: No auto-stop - user controls when to stop
+            last_successful_snapshot = {}  # Config snapshot when target was last hit
+            last_successful_round = 0  # Round number when target was last hit
+            last_successful_changes = []  # Changes applied up to successful round
+            target_ever_achieved = False  # Whether target was ever hit in this session
 
             # Check if first analysis is already a conclusion
             from .protocol.conclusion import SessionConclusion
@@ -2980,12 +3870,12 @@ def main():
 
                 round_custom_input = None
                 while True:
-                    cmd = ui.prompt("> ").strip().lower()
+                    cmd = ui.prompt("> ", default="/go").strip().lower()
 
                     if cmd in ['/go', '/g', '']:
                         break  # Continue without custom input
 
-                    if cmd in ['/stop', '/pause', '/quit', '/q']:
+                    if cmd in ['/stop', '/pause']:
                         ui.print()
                         if ui.console:
                             ui.console.print("[yellow]Pausing session...[/]")
@@ -2994,7 +3884,18 @@ def main():
                         if ws_session:
                             ws_session.pause()
                         ui.print(f"Session paused at Round {round_num}. Use /resume to continue later.")
-                        break
+                        raise StopIteration("SESSION")  # Return to session list
+
+                    if cmd in ['/quit', '/q']:
+                        ui.print()
+                        if ui.console:
+                            ui.console.print("[yellow]Pausing session...[/]")
+                        else:
+                            ui.print("Pausing session...")
+                        if ws_session:
+                            ws_session.pause()
+                        ui.print(f"Session paused. Returning to session list...")
+                        raise StopIteration("SESSION")  # Return to session list
 
                     if cmd in ['/status', '/s']:
                         ui.print(f"Round: {round_num} | Best TPS: {tuning_history['best_tps']:.0f} | Target: {target_tps:.0f}")
@@ -3028,9 +3929,10 @@ def main():
 
                     ui.print(f"[yellow]Unknown command: {cmd}. Type /go to continue or /custom for instructions.[/]" if ui.console else f"Unknown command: {cmd}")
 
-                # Handle /stop and /done exits
+                # Handle /stop and /done exits (these are now raised as StopIteration above)
+                # This check is kept for safety but shouldn't be reached
                 if cmd in ['/stop', '/pause', '/quit', '/q']:
-                    break  # Exit tuning loop
+                    raise StopIteration("SESSION")  # Exit tuning loop to session list
 
                 if round_custom_input == 'DONE':
                     break  # Exit tuning loop with current results
@@ -3094,18 +3996,23 @@ def main():
 
                 apply_action = None
                 while True:
-                    apply_cmd = ui.prompt("> ").strip().lower()
+                    apply_cmd = ui.prompt("> ", default="/apply").strip().lower()
 
-                    if apply_cmd in ['/apply', '/a', 'y', 'yes']:
+                    if apply_cmd in ['/apply', '/a', 'y', 'yes', '']:
                         apply_action = 'apply'
                         break
 
                     if apply_cmd in ['/stop', '/pause']:
                         if ws_session:
                             ws_session.pause()
-                        ui.print(f"Session paused at Round {round_num}.")
-                        apply_action = 'stop'
-                        break
+                        ui.print(f"Session paused at Round {round_num}. Returning to session list...")
+                        raise StopIteration("SESSION")
+
+                    if apply_cmd in ['/quit', '/q']:
+                        if ws_session:
+                            ws_session.pause()
+                        ui.print(f"Session paused. Returning to session list...")
+                        raise StopIteration("SESSION")
 
                     if apply_cmd in ['/skip', '/s']:
                         ui.print("Skipping this round...")
@@ -3120,7 +4027,7 @@ def main():
                                 ui.print(f"  → {apply_c}")
                         continue
 
-                    if apply_cmd in ['n', 'no', '']:
+                    if apply_cmd in ['n', 'no']:
                         ui.print("Tuning session ended by user.")
                         apply_action = 'end'
                         break
@@ -3184,6 +4091,22 @@ def main():
                                     ui, max_retries=5, timeout_sec=5
                                 )
                                 session_state.conn = conn
+
+                                # Verify applied settings after restart
+                                # Extract parameter names from all ALTER SYSTEM commands
+                                changed_params = []
+                                for chunk in applied_this_round:
+                                    for cmd in chunk.apply_commands:
+                                        if 'ALTER SYSTEM SET' in cmd.upper():
+                                            # Extract param: "ALTER SYSTEM SET param_name = ..."
+                                            import re
+                                            match = re.search(r'ALTER\s+SYSTEM\s+SET\s+(\w+)', cmd, re.IGNORECASE)
+                                            if match:
+                                                changed_params.append(match.group(1))
+
+                                if changed_params:
+                                    verify_applied_settings(conn, changed_params, ui)
+
                             except Exception as e:
                                 # Connection lost - set ERROR state
                                 if ws_session:
@@ -3250,7 +4173,17 @@ def main():
                                 message=f"Round {round_num} benchmark returned 0 TPS",
                                 recoverable=True
                             )
-                        break  # Exit tuning loop
+                        ui.print("Returning to session list...")
+                        raise StopIteration("SESSION")
+                    elif error_action in ['/quit', '/q']:
+                        if ws_session:
+                            ws_session.set_error(
+                                error_type="benchmark_failed",
+                                message=f"Round {round_num} benchmark returned 0 TPS",
+                                recoverable=True
+                            )
+                        ui.print("Returning to session list...")
+                        raise StopIteration("SESSION")
 
                 # ===== CHECKPOINT: Save round to workspace session =====
                 if ws_session:
@@ -3289,84 +4222,148 @@ def main():
                 if current_tps > tuning_history['best_tps']:
                     tuning_history['best_tps'] = current_tps
                     session_state.best_tps = current_tps
-                    ui.print(f"[green]New best TPS: {current_tps:.0f} (+{improvement_pct:.1f}%)[/]" if ui.console else f"New best TPS: {current_tps:.0f} (+{improvement_pct:.1f}%)")
 
-                # Check if target hit (with ±10% permissible range)
+                # Check if target hit
                 target_hit = False
-                if target_tps > 0:
-                    target_low = target_tps * 0.9   # -10%
-                    target_high = target_tps * 1.1  # +10%
+                if target_tps > 0 and current_tps >= target_tps:
+                    target_hit = True
+                    target_ever_achieved = True
 
-                    if current_tps >= target_low:
-                        target_hit = True
-                        no_target_hit_count = 0
-                        consecutive_target_hits += 1
+                    # Save successful snapshot for potential rollback
+                    last_successful_snapshot = capture_config_snapshot(conn, tuning_history['applied_changes'])
+                    last_successful_round = round_num
+                    last_successful_changes = tuning_history['applied_changes'].copy()
 
-                        if current_tps >= target_tps:
-                            ui.print(f"[bold green]🎉 Target TPS {target_tps:.0f} achieved! (current: {current_tps:.0f}) [{consecutive_target_hits}/{consecutive_hits_required} confirmations][/]" if ui.console else f"Target TPS {target_tps:.0f} achieved! [{consecutive_target_hits}/{consecutive_hits_required}]")
-                        else:
-                            ui.print(f"[green]Within target range ({target_low:.0f}-{target_high:.0f} TPS) [{consecutive_target_hits}/{consecutive_hits_required} confirmations][/]" if ui.console else f"Within target range [{consecutive_target_hits}/{consecutive_hits_required}]")
+                    ui.print(f"[bold green]🎉 Target TPS {target_tps:.0f} achieved! (current: {current_tps:.0f})[/]" if ui.console else f"Target TPS {target_tps:.0f} achieved!")
 
-                        # Only break after consecutive_hits_required confirmations
-                        if consecutive_target_hits >= consecutive_hits_required:
-                            ui.print(f"[bold green]Target confirmed with {consecutive_target_hits} consecutive hits![/]" if ui.console else f"Target confirmed!")
-                            break
-                        # Continue to next round for confirmation
+                # ===== AUTO-ROLLBACK: If target was achieved before but now regressed =====
+                if target_ever_achieved and not target_hit and last_successful_round > 0:
+                    ui.print()
+                    if ui.console:
+                        ui.console.print(f"[bold red]⚠ REGRESSION DETECTED![/] TPS dropped from {tuning_history['best_tps']:.0f} to {current_tps:.0f}")
+                        ui.console.print(f"[yellow]Auto-rolling back to Round {last_successful_round} configuration (when target was hit)...[/]")
                     else:
-                        consecutive_target_hits = 0  # Reset on miss
-                        no_target_hit_count += 1
-                        remaining = max_no_target_hit - no_target_hit_count
-                        ui.print(f"[yellow]Target not hit ({no_target_hit_count}/{max_no_target_hit}). Need {target_low:.0f}+ TPS[/]" if ui.console else f"Target not hit ({no_target_hit_count}/{max_no_target_hit})")
+                        ui.print(f"REGRESSION DETECTED! TPS dropped from {tuning_history['best_tps']:.0f} to {current_tps:.0f}")
+                        ui.print(f"Auto-rolling back to Round {last_successful_round}...")
 
-                        # Check if we should break - end game scenario
-                        if no_target_hit_count >= max_no_target_hit:
-                            ui.print()
-                            if ui.console:
-                                ui.console.print()
-                                ui.console.rule("[bold yellow]Session Ending[/]")
-                                ui.console.print(f"[yellow]Target not achieved after {max_no_target_hit} consecutive misses.[/]")
-                                ui.console.print(f"[dim]Best TPS: {tuning_history['best_tps']:.0f} | Target: {target_tps:.0f}[/]")
-                                ui.console.print()
-                                ui.console.print("[cyan]Consider trying a different strategy.[/]")
-                            else:
-                                ui.print(f"Target not achieved after {max_no_target_hit} rounds.")
-                                ui.print(f"Best TPS: {tuning_history['best_tps']:.0f} | Target: {target_tps:.0f}")
+                    # Perform auto-rollback
+                    rollback_result = rollback_to_snapshot(
+                        conn, last_successful_snapshot,
+                        tuning_history['applied_changes'],
+                        ui, ssh_config
+                    )
 
-                            # Mark session as FAILED (not just save - proper state transition)
-                            if ws_session:
-                                conclusion = f"Target not achieved after {max_no_target_hit} consecutive misses. Best TPS: {tuning_history['best_tps']:.0f}"
-                                ws_session.fail(conclusion)
-                                ui.show_status_line()
-                            break
+                    if rollback_result['success']:
+                        # Update tuning_history to reflect rollback
+                        tuning_history['applied_changes'] = last_successful_changes.copy()
 
-                # Get DBA action for next round - command-first pattern
+                        if rollback_result['restart_required']:
+                            ui.print("[yellow]Restart required for rollback...[/]" if ui.console else "Restart required...")
+                            restart_success = restart_postgresql_with_retry(ssh_config, ui)
+                            if restart_success:
+                                conn.close()
+                                conn = reconnect_with_retry(
+                                    args.host, args.port, args.user, password, database,
+                                    ui, max_retries=5, timeout_sec=5
+                                )
+                                session_state.conn = conn
+
+                        ui.print(f"[green]✓ Configuration rolled back to Round {last_successful_round}[/]" if ui.console else f"Rolled back to Round {last_successful_round}")
+                    else:
+                        ui.print("[red]Auto-rollback failed - manual intervention may be needed[/]" if ui.console else "Rollback failed")
+
+                # ===== ROUND SUMMARY WITH TPS CHART =====
+                display_round_summary(ui, round_num, current_tps, tuning_history, target_tps, target_hit)
+
+                # ===== ROUND-END PROMPT: Continue, Stop, or Rollback =====
                 ui.print()
                 if ui.console:
-                    ui.console.print("[cyan]Next Round Action[/]")
+                    ui.console.print("[bold cyan]Round Complete - What's Next?[/]")
+                    ui.console.print()
+                    ui.console.print("  [green]/go[/]      Continue to next round")
+                    ui.console.print("  [yellow]/done[/]    End session (keep current config)")
+                    if target_ever_achieved and not target_hit:
+                        ui.console.print(f"  [red]/rollback[/] Revert to Round {last_successful_round} config (when target was hit)")
+                    ui.console.print("  [dim]/custom[/]   Add instructions for AI")
+                    ui.console.print("  [dim]/pause[/]    Pause and return later")
                 else:
-                    ui.print("Next Round Action:")
-                ui.show_context_menu('tuning_round')
+                    ui.print("Round Complete - What's Next?")
+                    ui.print("  /go      - Continue to next round")
+                    ui.print("  /done    - End session")
+                    if target_ever_achieved and not target_hit:
+                        ui.print(f"  /rollback - Revert to Round {last_successful_round} config")
+                    ui.print("  /custom  - Add AI instructions")
+                    ui.print("  /pause   - Pause session")
 
                 human_feedback = None
                 next_action = None
                 while True:
-                    next_cmd = ui.prompt("> ").strip().lower()
+                    next_cmd = ui.prompt("> ", default="/go").strip().lower()
 
                     if next_cmd in ['/go', '/g', '']:
                         next_action = 'continue'
                         break
 
-                    if next_cmd in ['/stop', '/pause', '/quit', '/q']:
+                    if next_cmd in ['/done', '/d']:
+                        ui.print("Ending session with current results...")
+                        next_action = 'done'
+                        break
+
+                    if next_cmd in ['/rollback', '/rb'] and target_ever_achieved:
+                        ui.print()
+                        ui.print(f"[yellow]Rolling back to Round {last_successful_round} configuration...[/]" if ui.console else f"Rolling back to Round {last_successful_round}...")
+
+                        # Perform rollback
+                        rollback_result = rollback_to_snapshot(
+                            conn, last_successful_snapshot,
+                            tuning_history['applied_changes'],
+                            ui, ssh_config
+                        )
+
+                        if rollback_result['success']:
+                            # Update tuning_history to reflect rollback
+                            tuning_history['applied_changes'] = last_successful_changes.copy()
+
+                            if rollback_result['restart_required']:
+                                ui.print("[yellow]Restart required for some parameters...[/]" if ui.console else "Restart required...")
+                                restart_success = restart_postgresql_with_retry(ssh_config, ui)
+                                if restart_success:
+                                    # Reconnect
+                                    conn.close()
+                                    conn = reconnect_with_retry(
+                                        args.host, args.port, args.user, password, database,
+                                        ui, max_retries=5, timeout_sec=5
+                                    )
+                                    session_state.conn = conn
+
+                            ui.print(f"[green]Configuration rolled back to Round {last_successful_round}[/]" if ui.console else f"Rolled back to Round {last_successful_round}")
+                            ui.print("[dim]Run another benchmark to verify.[/]" if ui.console else "Run another benchmark to verify.")
+                        else:
+                            ui.print("[red]Rollback failed - continuing with current config[/]" if ui.console else "Rollback failed")
+
+                        next_action = 'continue'
+                        break
+
+                    if next_cmd in ['/stop', '/pause']:
                         ui.print()
                         ui.print("[yellow]Pausing session...[/]" if ui.console else "Pausing session...")
                         if ws_session:
                             ws_session.pause()
-                        ui.print(f"[green]Session paused. Use /resume to continue later.[/]" if ui.console else "Session paused.")
-                        next_action = 'stop'
-                        break
+                        ui.print(f"Session paused. Returning to session list...")
+                        raise StopIteration("SESSION")
+
+                    if next_cmd in ['/quit', '/q']:
+                        ui.print()
+                        ui.print("[yellow]Pausing session...[/]" if ui.console else "Pausing session...")
+                        if ws_session:
+                            ws_session.pause()
+                        ui.print(f"Session paused. Returning to session list...")
+                        raise StopIteration("SESSION")
 
                     if next_cmd in ['/status', '/s']:
                         ui.print(f"Round: {round_num} | Best TPS: {tuning_history['best_tps']:.0f} | Target: {target_tps:.0f}")
+                        if target_ever_achieved:
+                            ui.print(f"  Last successful: Round {last_successful_round}")
                         continue
 
                     if next_cmd in ['/history', '/h']:
@@ -3374,11 +4371,6 @@ def main():
                         for change in tuning_history.get('applied_changes', []):
                             ui.print(f"  R{change['round']}: {change['name']}")
                         continue
-
-                    if next_cmd in ['/done', '/d']:
-                        ui.print("Ending session with current results...")
-                        next_action = 'done'
-                        break
 
                     if next_cmd.startswith('/custom'):
                         # Extract inline text or prompt for it
@@ -3399,10 +4391,8 @@ def main():
                         next_action = 'continue'
                         break
 
-                    ui.print(f"[yellow]Unknown command: {next_cmd}. Type /go to continue or /custom for instructions.[/]" if ui.console else f"Unknown command: {next_cmd}")
+                    ui.print(f"[yellow]Unknown command: {next_cmd}. Type /go to continue or /done to end.[/]" if ui.console else f"Unknown command: {next_cmd}")
 
-                if next_action == 'stop':
-                    break
                 if next_action == 'done':
                     break
 
@@ -3470,13 +4460,25 @@ def main():
                 manager.save(session_data, args.save_session)
                 ui.print(f"\n[green]Session saved as '{args.save_session}'[/]" if ui.console else f"\nSession saved as '{args.save_session}'")
 
-            # ===================== CONTINUE OR EXIT =====================
+            # ===================== SESSION END - LIFECYCLE NAVIGATION =====================
             ui.print()
-            ui.show_context_menu('session_end')
-            continue_choice = ui.prompt("Continue with a different strategy? [y/N]: ").strip().lower()
+            if ui.console:
+                ui.console.print("\n[cyan]Session Complete. What would you like to do?[/]")
+                ui.console.print("  [green]/new[/]       - Start new session in this workspace")
+                ui.console.print("  [yellow]/back[/]      - Return to session list")
+                ui.console.print("  [blue]/workspace[/] - Return to workspace selection")
+                ui.console.print("  [red]/quit[/]      - Exit the tool")
+            else:
+                ui.print("\nSession Complete. What would you like to do?")
+                ui.print("  /new       - Start new session in this workspace")
+                ui.print("  /back      - Return to session list")
+                ui.print("  /workspace - Return to workspace selection")
+                ui.print("  /quit      - Exit the tool")
+
+            continue_choice = ui.prompt("\nChoice [/back]: ").strip().lower()
 
             # Handle slash commands
-            if continue_choice in ['/quit', '/q', 'n', 'no', '']:
+            if continue_choice in ['/quit', '/q', 'quit']:
                 ui.print()
                 if ui.console:
                     ui.console.print("[bold green]Thank you for using PostgreSQL Diagnostic Tool![/]")
@@ -3484,13 +4486,24 @@ def main():
                 else:
                     ui.print("Thank you for using PostgreSQL Diagnostic Tool!")
                     ui.print("Goodbye!")
-                break
+                raise SystemExit(0)  # Exit app completely
+
+            if continue_choice in ['/workspace', '/w', 'workspace']:
+                ui.print("[dim]Returning to workspace selection...[/]" if ui.console else "Returning to workspace selection...")
+                raise StopIteration("WORKSPACE")  # Signal to return to workspace selection
+
+            if continue_choice in ['/back', '/b', 'back', '']:
+                ui.print("[dim]Returning to session list...[/]" if ui.console else "Returning to session list...")
+                raise StopIteration("SESSION")  # Signal to return to session selection
+
             if continue_choice in ['/export', '/e']:
                 if ws_session:
                     ui.print(f"Session data saved in workspace: {workspace.name}")
                 continue
-            if continue_choice not in ['y', 'yes', '/new', '/n']:
-                break
+
+            if continue_choice not in ['y', 'yes', '/new', '/n', 'new']:
+                # Default to session list
+                raise StopIteration("SESSION")
 
             # ===================== GET NEW STRATEGIES FROM AI =====================
             # Build previous session summary for AI context
@@ -3540,6 +4553,29 @@ def main():
             ws_session = None
 
             # Continue - loop back to strategy selection with new strategies
+
+    except StopIteration as nav_signal:
+        # ===================== LIFECYCLE NAVIGATION =====================
+        # Handle navigation signals from session end
+        nav_target = str(nav_signal) if nav_signal.args else "SESSION"
+
+        if workspace_manager:
+            workspace_manager.close()
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        if nav_target == "WORKSPACE":
+            # Restart main() to go back to workspace selection
+            ui.print()
+            return main()
+        else:
+            # SESSION - restart main() to show session list for current workspace
+            # For now, restart main() - the workspace will be shown first
+            ui.print()
+            return main()
 
     except KeyboardInterrupt:
         ui.print("\nInterrupted by user")

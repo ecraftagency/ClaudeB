@@ -63,6 +63,7 @@ class BenchmarkRunner:
         self,
         strategy: StrategyDefinition,
         telemetry_collector=None,
+        progress_callback=None,
     ) -> BenchmarkResult:
         """
         Execute benchmark per strategy specification.
@@ -70,6 +71,7 @@ class BenchmarkRunner:
         Args:
             strategy: StrategyDefinition with execution plan
             telemetry_collector: Optional TelemetryCollector for metrics
+            progress_callback: Optional callback(tps, latency) for real-time progress
 
         Returns:
             BenchmarkResult with metrics and telemetry
@@ -91,10 +93,17 @@ class BenchmarkRunner:
         if telemetry_collector:
             telemetry_collector.start()
 
-        # Execute benchmark
+        # Execute benchmark (with streaming if callback provided)
         start_time = datetime.utcnow()
         try:
-            result = self._execute_pgbench(cmd, plan.duration_seconds + plan.warmup_seconds + 30)
+            if progress_callback:
+                result = self._execute_pgbench_streaming(
+                    cmd,
+                    plan.duration_seconds + plan.warmup_seconds + 30,
+                    progress_callback
+                )
+            else:
+                result = self._execute_pgbench(cmd, plan.duration_seconds + plan.warmup_seconds + 30)
             success = True
             error = None
         except Exception as e:
@@ -211,6 +220,96 @@ class BenchmarkRunner:
         return {
             "raw_output": result.stdout + "\n" + result.stderr,
             "returncode": result.returncode,
+        }
+
+    def _execute_pgbench_streaming(
+        self,
+        cmd: List[str],
+        timeout: int,
+        progress_callback
+    ) -> Dict[str, Any]:
+        """Execute pgbench with streaming output for real-time progress.
+
+        Args:
+            cmd: pgbench command
+            timeout: timeout in seconds
+            progress_callback: callback(tps, latency) called on each progress line
+        """
+        import select
+        import time
+
+        env = os.environ.copy()
+        if self.config.pg_password:
+            env['PGPASSWORD'] = self.config.pg_password
+
+        # Build command (SSH or local)
+        if self.config.ssh_host:
+            run_cmd = [
+                "ssh", "-o", "StrictHostKeyChecking=no",
+                f"{self.config.ssh_user}@{self.config.ssh_host}",
+                ' '.join(cmd)
+            ]
+        else:
+            run_cmd = cmd
+
+        # Start process with streaming
+        process = subprocess.Popen(
+            run_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            bufsize=1,  # Line buffered
+        )
+
+        output_lines = []
+        start_time = time.time()
+
+        # Progress line pattern: "progress: 5.0 s, 1234.5 tps, lat 8.123 ms stddev 2.345"
+        progress_pattern = re.compile(
+            r'progress:\s*[\d.]+\s*s,\s*([\d.]+)\s*tps,\s*lat\s*([\d.]+)\s*ms'
+        )
+
+        try:
+            while True:
+                # Check timeout
+                if time.time() - start_time > timeout:
+                    process.kill()
+                    raise TimeoutError(f"pgbench timed out after {timeout}s")
+
+                # Read line (non-blocking would be better but this works)
+                line = process.stdout.readline()
+                if not line:
+                    if process.poll() is not None:
+                        break
+                    continue
+
+                output_lines.append(line)
+
+                # Parse progress line
+                match = progress_pattern.search(line)
+                if match:
+                    tps = float(match.group(1))
+                    latency = float(match.group(2))
+                    try:
+                        progress_callback(tps, latency)
+                    except Exception:
+                        pass  # Don't let callback errors break benchmark
+
+            # Get any remaining output
+            remaining = process.stdout.read()
+            if remaining:
+                output_lines.append(remaining)
+
+            returncode = process.wait()
+
+        except Exception as e:
+            process.kill()
+            raise
+
+        return {
+            "raw_output": ''.join(output_lines),
+            "returncode": returncode,
         }
 
     def _parse_pgbench_output(self, output: str) -> BenchmarkMetrics:

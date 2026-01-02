@@ -210,6 +210,34 @@ If `human_feedback` is provided, consider it carefully:
 4. Provide accurate rollback_commands to restore original state
 5. Set realistic expected_improvement based on bottleneck analysis
 
+### CRITICAL SAFETY RULES (MUST FOLLOW)
+**WARNING: Violating these rules will crash PostgreSQL or cause data loss!**
+
+#### Memory Safety
+1. **NEVER set `huge_pages = 'on'`** - Always use `huge_pages = 'try'` or `'off'`. Setting 'on' requires pre-configured OS huge pages which may not be available, causing PostgreSQL to fail to start.
+
+2. **shared_buffers constraint**: Maximum shared_buffers = 25% of total RAM (check system_context for MemTotal). Example: For 16GB RAM, max shared_buffers = 4GB. Going higher risks memory allocation failure.
+
+3. **Memory allocation check**: Before recommending shared_buffers changes, verify:
+   - Current MemAvailable > proposed shared_buffers + 2GB safety margin
+   - wal_buffers should be at most 1/16th of shared_buffers (max 256MB)
+
+4. **Safe restart sequence**: If changing memory parameters (shared_buffers, wal_buffers, huge_pages):
+   - Always include `huge_pages = 'try'` in same chunk
+   - Set requires_restart: true
+   - Provide conservative rollback values
+
+#### Command Safety
+5. **NEVER use destructive commands** in apply_commands:
+   - NO `DROP` commands (DROP TABLE, DROP INDEX, DROP EXTENSION, etc.)
+   - NO `TRUNCATE` commands
+   - NO `DELETE` without WHERE clause
+   - NO `ALTER TABLE ... DROP COLUMN`
+
+6. **Only use ALTER SYSTEM SET** for PostgreSQL configuration changes. Example:
+   - CORRECT: `ALTER SYSTEM SET work_mem = '64MB'`
+   - WRONG: `DROP INDEX some_index`
+
 ### Diminishing Returns Detection
 
 If improvement from last iteration was < 2%, and you've already optimized the main bottlenecks, consider concluding with `conclusion_reason: "DIMINISHING_RETURNS"`.
@@ -434,41 +462,93 @@ Based on this information, suggest Round 1 configuration changes to optimize for
 ### Guidelines
 
 1. **Focus on the benchmark goal**: Only suggest changes that will improve the specific benchmark type
-2. **Be conservative**: This is Round 1, suggest safe optimizations that are widely applicable
-3. **CRITICAL - FORBIDDEN SETTINGS in Round 1**:
-   - Do NOT change shared_buffers (can crash PostgreSQL if set too high)
-   - Do NOT enable or change huge_pages (requires OS-level pre-configuration)
-   - Do NOT change max_connections drastically (can cause OOM)
-4. **Safe memory settings**: Only adjust effective_cache_size (doesn't allocate memory)
-5. **WAL settings**: For write-heavy benchmarks, optimize wal_buffers (max 64MB), checkpoint settings
-6. **OS tuning**: Include sysctl changes for vm.dirty_ratio, vm.dirty_background_ratio, vm.swappiness
-7. **Prefer no-restart settings**: Focus on parameters that can be changed with pg_reload_conf()
-8. **Provide rollback**: Always include rollback commands to restore original state
-9. **Empty tuning_chunks is acceptable**: If current config is already optimal, return empty arrays
+2. **BE AGGRESSIVE**: Push for maximum performance. The user wants to squeeze every bit of TPS.
+3. **Memory is king for OLTP**: shared_buffers should be 25-40% of total RAM for write-heavy workloads
+4. **DO NOT be overly conservative**: If you see undersized settings, FIX THEM AGGRESSIVELY
+5. **Provide rollback**: Always include rollback commands to restore original state
+6. **Empty tuning_chunks is acceptable**: If current config is already optimal, return empty arrays
 
-### Common Round 1 Tunings (SAFE - No Restart Required)
+### Key Memory Tuning Principles
 
-**For OLTP/Write benchmarks:**
-- Optimize checkpoint_completion_target (0.9)
-- Tune wal_buffers (up to 64MB)
-- Set synchronous_commit = off for max throughput testing
-- Increase bgwriter_lru_maxpages for faster background writes
-- Set wal_compression = lz4 or on
+**shared_buffers (CRITICAL - most impactful setting):**
+- For OLTP: 25-40% of RAM (e.g., 8-12GB on 32GB system)
+- For read-heavy: 25% of RAM is usually sufficient
+- If currently at default 128MB, this is SEVERELY undersized - increase it!
+- Requires restart but worth it for 2-5x performance gains
+
+**effective_cache_size:**
+- Set to 75% of total RAM (e.g., 24GB on 32GB system)
+- This is a planning hint, doesn't allocate memory
+- Should always be set aggressively
+
+**work_mem:**
+- For OLTP: 64-256MB per connection
+- For complex queries: 256MB-1GB
+- Be mindful of max_connections * work_mem
+
+**huge_pages:**
+- Enable 'try' or 'on' for systems with large shared_buffers
+- Requires OS pre-configuration but significantly reduces TLB misses
+
+### Common Round 1 Tunings
+
+**For OLTP/Write benchmarks (BE AGGRESSIVE):**
+- shared_buffers = 25-40% of RAM (e.g., 8GB on 32GB system) - THIS IS CRITICAL
+- effective_cache_size = 75% of RAM (e.g., 24GB on 32GB system)
+- work_mem = 64MB-256MB
+- wal_buffers = 64MB-256MB
+- checkpoint_completion_target = 0.9
+- wal_compression = lz4 (if PostgreSQL 15+) or 'on'
+- max_wal_size = 4GB-16GB for write-heavy workloads
+- min_wal_size = 1GB-2GB
+
+**FORBIDDEN - Never suggest these (cheap/unsafe tuning):**
+- synchronous_commit = off (NEVER disable - this is cheap tuning that sacrifices durability)
+- fsync = off (NEVER - data corruption risk)
 
 **For Read benchmarks:**
-- Increase effective_cache_size (75% of RAM) - safe, doesn't allocate memory
-- Tune random_page_cost (1.1 for SSD/NVMe)
-- Increase work_mem for complex queries (be conservative, e.g., 64MB)
+- effective_cache_size = 75% of RAM
+- random_page_cost = 1.1 for SSD/NVMe
+- work_mem = 256MB-1GB for complex queries
+- shared_buffers = 25% of RAM
 
-**OS Settings:**
+**OS Settings (BE COMPREHENSIVE - include all relevant tuning):**
+
+*Memory & VM (sysctl):*
 - vm.dirty_ratio = 10-15
 - vm.dirty_background_ratio = 3-5
 - vm.swappiness = 1-10
+- vm.overcommit_memory = 2
+- vm.overcommit_ratio = 80-90
+- vm.zone_reclaim_mode = 0
+- vm.nr_hugepages = (shared_buffers / 2MB) for huge_pages support
 
-**NEVER suggest in Round 1:**
-- shared_buffers changes
-- huge_pages changes
-- max_connections reduction by more than 50%
+*Disk I/O (critical for database performance):*
+- I/O scheduler: none or mq-deadline for NVMe (echo none > /sys/block/nvme*/queue/scheduler)
+- Read-ahead: blockdev --setra 4096 /dev/nvme* (or 256-512 for random workloads)
+- nr_requests: echo 256 > /sys/block/nvme*/queue/nr_requests
+
+*Network/TCP (for connection pooling and replication):*
+- net.core.somaxconn = 65535
+- net.core.netdev_max_backlog = 65535
+- net.ipv4.tcp_max_syn_backlog = 65535
+- net.ipv4.tcp_fin_timeout = 10
+- net.ipv4.tcp_tw_reuse = 1
+- net.core.rmem_max = 16777216
+- net.core.wmem_max = 16777216
+
+*File Descriptors & Limits:*
+- fs.file-max = 2097152
+- fs.nr_open = 2097152
+- ulimit -n 1048576 (via /etc/security/limits.conf: postgres soft/hard nofile 1048576)
+- fs.aio-max-nr = 1048576 (for async I/O)
+
+*Kernel Semaphores (for PostgreSQL connections):*
+- kernel.shmmax = (total RAM in bytes)
+- kernel.shmall = (total RAM / page size)
+- kernel.sem = 250 32000 100 128
+
+**Restart is OK** - Don't avoid restart-requiring settings. Performance gains justify restart.
 
 Output ONLY valid JSON matching the schema above. No explanations outside JSON.
 """

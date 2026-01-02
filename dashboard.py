@@ -399,117 +399,220 @@ class Dashboard:
 
 class ProgressTimeline:
     """
-    Visual timeline showing tuning progress.
+    Visual timeline showing tuning progress with milestone indicators.
 
     Example output:
-    ═══════════════════════════════════════════════════════
-      ●────────●────────●────────●────────○────────○
-      │        │        │        │        │        │
-    Baseline  R1       R2       R3      R4       Target
-    3,500    4,200    5,100    5,892    ???      6,000
-             +20%     +21%     +15%
+    Session Timeline:
+    ════════════════════════════════════════════════════════════════════
+      ●────────●────────●────────✗────────○
+      │        │        │        │        │
+    Baseline  R1       R2       R3      Target
+     3,500   4,200    5,100    4,800    6,000
+             +20%     +21%     -6%
+              ✓        ✓        ✗
+
+    Legend: ● = completed  ✓ = target hit  ✗ = target miss  ○ = pending
     """
 
     def __init__(self, console=None):
         self.console = console or (Console() if RICH_AVAILABLE else None)
 
     def display(self, tps_history: List[float], target_tps: float, current_round: int,
-                target_achieved: bool = False):
-        """Display the progress timeline."""
+                target_achieved: bool = False, round_results: List[Dict] = None):
+        """
+        Display the progress timeline.
+
+        Args:
+            tps_history: List of TPS values [baseline, r1, r2, ...]
+            target_tps: Target TPS to achieve
+            current_round: Current round number
+            target_achieved: Whether target was achieved in latest round
+            round_results: Optional list of round metadata [{'hit': bool, 'config_applied': bool}, ...]
+        """
         if not tps_history:
             return
 
         if self.console and RICH_AVAILABLE:
-            self._display_rich(tps_history, target_tps, current_round, target_achieved)
+            self._display_rich(tps_history, target_tps, current_round, target_achieved, round_results)
         else:
-            self._display_plain(tps_history, target_tps, current_round, target_achieved)
+            self._display_plain(tps_history, target_tps, current_round, target_achieved, round_results)
 
     def _display_rich(self, tps_history: List[float], target_tps: float, current_round: int,
-                       target_achieved: bool = False):
-        """Rich display of timeline."""
-        # Build timeline
-        points = len(tps_history)
+                       target_achieved: bool = False, round_results: List[Dict] = None):
+        """Rich display of timeline with milestone indicators.
 
-        # If target achieved, only show completed rounds + target (no future ???)
-        if target_achieved:
-            total_points = points + 1  # completed rounds + target
-        else:
-            total_points = points + 2  # +1 for future, +1 for target
+        Shows only completed rounds + target goal. No future rounds.
+        """
+        points = len(tps_history)  # This is baseline + completed rounds
 
-        # Top line
-        line1 = "  "
-        for i in range(total_points):
-            if i < points:
-                line1 += "[green]●[/]" + "────────"
-            elif not target_achieved and i == points:
-                line1 += "[yellow]○[/]" + "────────"
-            else:
-                # Target point
-                if target_achieved:
-                    line1 += "[green]●[/]"  # Target achieved
+        # Build round_results if not provided
+        if round_results is None:
+            round_results = []
+            for i, tps in enumerate(tps_history):
+                if i == 0:
+                    # Baseline - no target check
+                    round_results.append({'hit': False, 'is_baseline': True})
                 else:
-                    line1 += "[dim]○[/]"
+                    hit = tps >= target_tps if target_tps > 0 else False
+                    round_results.append({'hit': hit, 'is_baseline': False})
 
-        # Connector line
-        line2 = "  "
-        for i in range(total_points):
-            line2 += "│        "
+        # Column width for proper spacing - must accommodate "Baseline" (8 chars)
+        COL_WIDTH = 12
 
-        # Labels - don't show future round if target achieved
-        if target_achieved:
-            labels = ["Baseline"] + [f"R{i+1}" for i in range(points - 1)] + ["Target"]
-        else:
-            labels = ["Baseline"] + [f"R{i+1}" for i in range(points - 1)] + ["R" + str(points), "Target"]
+        # Build labels first
+        labels = ["Baseline"] + [f"R{i}" for i in range(1, points)] + ["Target"]
+        total_cols = len(labels)
+
+        # Get all dots/symbols for each column
+        dots = []
+        for i in range(total_cols):
+            if i == 0:
+                dots.append("[cyan]●[/]")
+            elif i < points:
+                if round_results[i].get('hit', False):
+                    dots.append("[bold green]●[/]")
+                else:
+                    dots.append("[bold red]✗[/]")
+            else:
+                if target_achieved:
+                    dots.append("[bold green]★[/]")
+                else:
+                    dots.append("[dim]○[/]")
+
+        # Build lines with proper centering
+        # Each column is COL_WIDTH chars, dot/connector should be at center
+        CENTER = COL_WIDTH // 2  # Position 6 for width 12
+
+        # Line 1: dots connected by dashes
+        # Pattern: [pad][dot][dashes...][dot][dashes...][dot]
+        line1_parts = []
+        for i, dot in enumerate(dots):
+            if i == 0:
+                # First: pad to center, dot, then dashes to fill column
+                line1_parts.append(" " * CENTER + dot + "─" * (COL_WIDTH - CENTER - 1))
+            elif i == total_cols - 1:
+                # Last: dashes from prev, dot at center
+                line1_parts.append("─" * CENTER + dot + " " * (COL_WIDTH - CENTER - 1))
+            else:
+                # Middle: dashes from prev, dot at center, dashes to next
+                line1_parts.append("─" * CENTER + dot + "─" * (COL_WIDTH - CENTER - 1))
+        line1 = "".join(line1_parts)
+
+        # Line 2: connector bars at same position as dots
+        line2_parts = []
+        for i in range(total_cols):
+            line2_parts.append(" " * CENTER + "│" + " " * (COL_WIDTH - CENTER - 1))
+        line2 = "".join(line2_parts)
+
+        # Labels line - center each label in its column
         line3 = ""
         for label in labels:
-            line3 += f"{label:^9}"
+            line3 += f"{label:^{COL_WIDTH}}"
 
-        # Values - don't show ??? if target achieved
-        if target_achieved:
-            values = [f"{t:,.0f}" for t in tps_history] + [f"{target_tps:,.0f}"]
-        else:
-            values = [f"{t:,.0f}" for t in tps_history] + ["???", f"{target_tps:,.0f}"]
+        # TPS Values - build without markup first, then add colors
         line4 = ""
-        for val in values:
-            line4 += f"{val:^9}"
+        for i, tps in enumerate(tps_history):
+            tps_str = f"{tps:,.0f}"
+            padding = COL_WIDTH - len(tps_str)
+            left_pad = padding // 2
+            right_pad = padding - left_pad
+            if i == 0:
+                line4 += " " * left_pad + f"[cyan]{tps_str}[/]" + " " * right_pad
+            elif round_results[i].get('hit', False):
+                line4 += " " * left_pad + f"[bold green]{tps_str}[/]" + " " * right_pad
+            else:
+                line4 += " " * left_pad + f"[bold red]{tps_str}[/]" + " " * right_pad
+        # Target
+        target_str = f"{target_tps:,.0f}"
+        padding = COL_WIDTH - len(target_str)
+        left_pad = padding // 2
+        right_pad = padding - left_pad
+        line4 += " " * left_pad + f"[bold yellow]{target_str}[/]" + " " * right_pad
 
-        # Improvements
-        improvements = [""]
+        # Improvements with color coding (change from previous)
+        line5 = " " * COL_WIDTH  # Empty for baseline
         for i in range(1, len(tps_history)):
-            pct = (tps_history[i] - tps_history[i-1]) / tps_history[i-1] * 100
-            improvements.append(f"+{pct:.0f}%")
-        improvements += ["", ""]
-        line5 = ""
-        for imp in improvements:
-            line5 += f"[green]{imp:^9}[/]"
+            if tps_history[i-1] > 0:
+                pct = (tps_history[i] - tps_history[i-1]) / tps_history[i-1] * 100
+                if pct >= 0:
+                    pct_str = f"+{pct:.0f}%"
+                    padding = COL_WIDTH - len(pct_str)
+                    left_pad = padding // 2
+                    right_pad = padding - left_pad
+                    line5 += " " * left_pad + f"[green]{pct_str}[/]" + " " * right_pad
+                else:
+                    pct_str = f"{pct:.0f}%"
+                    padding = COL_WIDTH - len(pct_str)
+                    left_pad = padding // 2
+                    right_pad = padding - left_pad
+                    line5 += " " * left_pad + f"[red]{pct_str}[/]" + " " * right_pad
+            else:
+                line5 += f"{'N/A':^{COL_WIDTH}}"
+        line5 += " " * COL_WIDTH  # Empty for target
 
+        # Status indicators line (hit/miss)
+        line6 = " " * COL_WIDTH  # Empty for baseline
+        for i in range(1, len(tps_history)):
+            if round_results[i].get('hit', False):
+                status_str = "✓ hit"
+                padding = COL_WIDTH - len(status_str)
+                left_pad = padding // 2
+                right_pad = padding - left_pad
+                line6 += " " * left_pad + f"[green]{status_str}[/]" + " " * right_pad
+            else:
+                status_str = "✗ miss"
+                padding = COL_WIDTH - len(status_str)
+                left_pad = padding // 2
+                right_pad = padding - left_pad
+                line6 += " " * left_pad + f"[red]{status_str}[/]" + " " * right_pad
+        line6 += " " * COL_WIDTH  # Empty for target
+
+        # Print timeline
         self.console.print()
         self.console.print("[bold]Session Timeline:[/]")
-        self.console.print("═" * (total_points * 9 + 2))
+        self.console.print("═" * (len(labels) * COL_WIDTH + 2))
         self.console.print(line1)
         self.console.print(line2)
         self.console.print(line3)
         self.console.print(line4)
         self.console.print(line5)
+        self.console.print(line6)
+        self.console.print()
+        self.console.print("[dim]Legend: [cyan]●[/]=baseline  [green]●[/]=hit  [red]✗[/]=miss  [green]★[/]=goal  ○=pending[/]")
         self.console.print()
 
     def _display_plain(self, tps_history: List[float], target_tps: float, current_round: int,
-                       target_achieved: bool = False):
+                       target_achieved: bool = False, round_results: List[Dict] = None):
         """Plain text timeline."""
         print("\nSession Timeline:")
         print("=" * 60)
+
+        # Build round_results if not provided
+        if round_results is None:
+            round_results = []
+            for i, tps in enumerate(tps_history):
+                if i == 0:
+                    round_results.append({'hit': False, 'is_baseline': True})
+                else:
+                    hit = tps >= target_tps if target_tps > 0 else False
+                    round_results.append({'hit': hit, 'is_baseline': False})
 
         # Simple text representation
         for i, tps in enumerate(tps_history):
             label = "Baseline" if i == 0 else f"Round {i}"
             improvement = ""
-            if i > 0:
-                pct = (tps - tps_history[i-1]) / tps_history[i-1] * 100
-                improvement = f" (+{pct:.0f}%)"
-            print(f"  {label}: {tps:,.0f} TPS{improvement}")
+            status = ""
 
-        status = " ✓ ACHIEVED" if target_achieved else ""
-        print(f"  Target: {target_tps:,.0f} TPS{status}")
+            if i > 0:
+                pct = (tps - tps_history[i-1]) / tps_history[i-1] * 100 if tps_history[i-1] > 0 else 0
+                improvement = f" ({pct:+.0f}%)"
+                status = " [HIT]" if round_results[i].get('hit', False) else " [MISS]"
+
+            print(f"  {label}: {tps:,.0f} TPS{improvement}{status}")
+
+        goal_status = " ★ ACHIEVED" if target_achieved else ""
+        print(f"  Target: {target_tps:,.0f} TPS{goal_status}")
+        print()
 
 
 class DiffView:

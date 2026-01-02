@@ -169,6 +169,7 @@ class IOStatCollector:
     def collect_once(self) -> Dict[str, Any]:
         """Collect a single iostat sample."""
         cmd = "iostat -xdm 1 2"
+        import sys
 
         try:
             if self.ssh_config:
@@ -196,10 +197,16 @@ class IOStatCollector:
 
                 if device_count >= 2:
                     self._parse_block(lines[start_idx:])
+                    if not self._latest:
+                        print(f"[IOSTAT] Parsed but empty. Lines: {lines[start_idx:start_idx+5]}", file=sys.stderr, flush=True)
                     return self._latest.copy()
+                else:
+                    print(f"[IOSTAT] Only {device_count} Device headers found. First 10 lines: {lines[:10]}", file=sys.stderr, flush=True)
+            else:
+                print(f"[IOSTAT] returncode={result.returncode}, stderr={result.stderr[:200]}", file=sys.stderr, flush=True)
 
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[IOSTAT] Exception: {e}", file=sys.stderr, flush=True)
 
         return {}
 

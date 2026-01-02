@@ -196,6 +196,15 @@ class CommandHandler:
             self._cmd_queries, aliases=["q"]
         )
 
+    def has_command(self, input_str: str) -> bool:
+        """Check if input is a recognized command."""
+        input_str = input_str.strip()
+        if not input_str.startswith('/'):
+            return False
+        parts = input_str[1:].split(maxsplit=1)
+        cmd_name = parts[0].lower()
+        return self.registry.get(cmd_name) is not None
+
     def parse_and_execute(self, input_str: str) -> bool:
         """
         Parse input and execute if it's a command.
@@ -219,11 +228,10 @@ class CommandHandler:
                 cmd.handler(args)
             except Exception as e:
                 self._print_error(f"Command failed: {e}")
+            return True
         else:
-            self._print_error(f"Unknown command: /{cmd_name}")
-            self._print("Type /help for available commands")
-
-        return True
+            # Command not recognized - don't handle it
+            return False
 
     def _print(self, message: str = ""):
         """Print a message."""
