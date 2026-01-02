@@ -1,0 +1,43 @@
+# pg_diagnose Configuration
+# Copy this file to config.toml and customize for your environment
+
+[database]
+host = "localhost"          # Database host (or pgcat/pgbouncer host)
+port = 5432                  # Database port
+user = "postgres"
+password = "postgres"
+name = "postgres"            # Database name
+
+[ssh]
+# SSH connection for applying changes directly on the PostgreSQL server
+host = ""                    # Leave empty if database is local
+user = "ubuntu"
+key = ""                     # Path to SSH private key (optional)
+
+[benchmark]
+duration = 60                # Benchmark duration in seconds
+scale = 100                  # pgbench scale factor
+clients = 32                 # Number of concurrent clients
+threads = 8                  # Number of threads
+
+[tuning]
+max_rounds = 3               # Maximum tuning iterations
+target_improvement = 20.0    # Target improvement percentage
+auto_apply = false           # Automatically apply changes without confirmation
+
+[ai]
+provider = "gemini"          # AI provider: gemini, openai, anthropic
+model = "gemini-3-flash-preview"
+# api_key = ""               # Set via GEMINI_API_KEY env var (recommended)
+
+[output]
+dir = "./pg_diagnose_output"
+verbose = true
+quiet = false
+
+[advanced]
+# PostgreSQL data directory (auto-detected if not set)
+# data_directory = "/var/lib/postgresql/14/main"
+
+# Skip certain checks
+skip_ssh_verify = true

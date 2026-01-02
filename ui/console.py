@@ -2,9 +2,10 @@
 ConsoleUI - Rich-based console interface.
 
 Provides interactive progress display and result formatting.
+v2.4: Added workflow progress, live TPS, and AI thinking indicators.
 """
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
 from dataclasses import asdict
 
 try:
@@ -23,11 +24,21 @@ except ImportError:
     RICH_AVAILABLE = False
 
 from ..runner.state import State
+from .progress import (
+    WorkflowPhase,
+    WorkflowProgress,
+    SessionTimeline,
+    LiveTPSDisplay,
+    AIThinkingIndicator,
+    UnifiedStatusBar,
+)
 
 
 class ConsoleUI:
     """
     Rich console interface for pg_diagnose.
+
+    v2.4: Enhanced with workflow progress, live TPS, and AI thinking indicators.
     """
 
     def __init__(self, quiet: bool = False):
@@ -35,6 +46,12 @@ class ConsoleUI:
         self.console = Console() if RICH_AVAILABLE else None
         self._progress = None
         self._live = None
+
+        # v2.4: New progress components
+        self.status_bar = UnifiedStatusBar(self.console)
+        self.ai_indicator = AIThinkingIndicator(self.console)
+        self.live_tps = LiveTPSDisplay(self.console)
+        self._show_status_bar = True
 
     def print(self, *args, **kwargs):
         """Print to console."""
@@ -428,3 +445,191 @@ class ConsoleUI:
             self._progress.stop()
             self._progress = None
             self._task_id = None
+
+    # =========================================================================
+    # v2.4: Workflow Progress Methods
+    # =========================================================================
+
+    def set_phase(self, phase: WorkflowPhase):
+        """Set current workflow phase and display status."""
+        if self.quiet:
+            return
+        self.status_bar.update(phase=phase)
+        self.show_status()
+
+    def set_round(self, round_num: int, max_rounds: int = 3):
+        """Set current tuning round."""
+        self.status_bar.update(round=round_num, max_rounds=max_rounds)
+
+    def set_tps(self, current: float, target: float = None, baseline: float = None):
+        """Update TPS values in status bar."""
+        self.status_bar.update(
+            current_tps=current,
+            target_tps=target,
+            baseline_tps=baseline
+        )
+
+    def add_completed_round(self, round_num: int, improvement_pct: float):
+        """Record a completed round."""
+        self.status_bar.update(completed_round={
+            'round': round_num,
+            'improvement_pct': improvement_pct,
+        })
+
+    def show_status(self):
+        """Display the status bar."""
+        if self.quiet or not self._show_status_bar:
+            return
+        self.status_bar.display()
+
+    def show_status_with_timeline(self):
+        """Display status bar with session timeline."""
+        if self.quiet or not self._show_status_bar:
+            return
+        self.status_bar.display_with_timeline()
+
+    def enable_status_bar(self, enabled: bool = True):
+        """Enable or disable automatic status bar display."""
+        self._show_status_bar = enabled
+
+    # =========================================================================
+    # v2.4: AI Thinking Indicator
+    # =========================================================================
+
+    def start_ai_thinking(self, message: str = "AI analyzing...", estimated_seconds: int = 30):
+        """Start AI thinking indicator with spinner."""
+        if self.quiet:
+            return
+        self.ai_indicator.start(message, estimated_seconds)
+
+    def update_ai_thinking(self, message: str):
+        """Update AI thinking message."""
+        if self.quiet:
+            return
+        self.ai_indicator.update(message)
+
+    def stop_ai_thinking(self, final_message: str = None):
+        """Stop AI thinking indicator."""
+        self.ai_indicator.stop(final_message)
+
+    # =========================================================================
+    # v2.4: Live TPS Display
+    # =========================================================================
+
+    def start_live_benchmark(self, duration_seconds: int, tps_callback: Callable[[], float] = None):
+        """Start live TPS display during benchmark."""
+        if self.quiet:
+            return
+
+        if tps_callback:
+            self.live_tps.start_live(duration_seconds, tps_callback)
+        else:
+            # Just show a simple progress message
+            self.print(f"\n  [dim]Running benchmark for {duration_seconds}s...[/]")
+
+    def stop_live_benchmark(self):
+        """Stop live benchmark display."""
+        self.live_tps.stop_live()
+
+    def add_tps_reading(self, tps: float):
+        """Add a TPS reading during benchmark."""
+        self.live_tps.add_tps(tps)
+
+    # =========================================================================
+    # v2.4: Enhanced Headers with Phase Context
+    # =========================================================================
+
+    def print_phase_header(self, phase: WorkflowPhase, subtitle: str = None):
+        """Print a phase header with step indicator."""
+        if self.quiet:
+            return
+
+        self.set_phase(phase)
+
+        step = self.status_bar.workflow.state.phase_number
+        total = self.status_bar.workflow.state.total_phases
+
+        if self.console:
+            self.console.print()
+
+            # Step indicator line
+            step_text = Text()
+            step_text.append(f"  Step {step}/{total}: ", style="dim")
+            step_text.append(phase.display_name, style="bold cyan")
+            if subtitle:
+                step_text.append(f" - {subtitle}", style="dim")
+
+            self.console.print(step_text)
+            self.console.rule(style="dim")
+        else:
+            print()
+            print(f"  Step {step}/{total}: {phase.display_name}" + (f" - {subtitle}" if subtitle else ""))
+            print("-" * 60)
+
+    def print_round_header(self, round_num: int, max_rounds: int = 3):
+        """Print a tuning round header."""
+        if self.quiet:
+            return
+
+        self.set_round(round_num, max_rounds)
+
+        if self.console:
+            self.console.print()
+            self.console.print(
+                f"  [bold cyan]━━━ Round {round_num} of {max_rounds} ━━━[/]"
+            )
+        else:
+            print()
+            print(f"  === Round {round_num} of {max_rounds} ===")
+
+    def print_change_summary(self, changes: List[Dict[str, Any]], requires_restart: bool = False):
+        """Print a summary of changes to be applied."""
+        if self.quiet:
+            return
+
+        if self.console:
+            summary = Text()
+            summary.append(f"  {len(changes)} changes", style="bold")
+
+            if requires_restart:
+                summary.append(" • ", style="dim")
+                summary.append("restart required", style="yellow")
+
+            self.console.print(summary)
+        else:
+            restart_text = " (restart required)" if requires_restart else ""
+            print(f"  {len(changes)} changes{restart_text}")
+
+    def print_tps_comparison(self, before: float, after: float, target: float = None):
+        """Print TPS comparison (before → after)."""
+        if self.quiet:
+            return
+
+        improvement = ((after - before) / before * 100) if before > 0 else 0
+        sign = "+" if improvement >= 0 else ""
+
+        if self.console:
+            color = "green" if improvement >= 0 else "red"
+            text = Text()
+            text.append(f"  TPS: {before:,.0f}", style="dim")
+            text.append(" → ", style="dim")
+            text.append(f"{after:,.0f}", style=f"bold {color}")
+            text.append(f" ({sign}{improvement:.1f}%)", style=color)
+
+            if target and after >= target:
+                text.append(" ✓ Target reached!", style="bold green")
+
+            self.console.print(text)
+        else:
+            target_text = " ✓ Target reached!" if (target and after >= target) else ""
+            print(f"  TPS: {before:,.0f} → {after:,.0f} ({sign}{improvement:.1f}%){target_text}")
+
+    def print_command_hint(self, hint: str):
+        """Print a command hint for the user."""
+        if self.quiet:
+            return
+
+        if self.console:
+            self.console.print(f"  [dim]Tip: {hint}[/]")
+        else:
+            print(f"  Tip: {hint}")

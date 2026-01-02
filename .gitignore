@@ -42,6 +42,10 @@ htmlcov/
 # Workspaces (user data)
 workspaces/
 
+# Config files (may contain secrets)
+config.toml
+!config.example.toml
+
 # Logs
 *.log
 
